@@ -221,16 +221,31 @@ class DisclaimerDialog(tk.Toplevel):
         self.on_done(dont_show)
 
 
+def read_text_file(path: Path):
+    """读文本文件并给出实际编码；预览文件可能是 UTF-8 也可能是 GBK。"""
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig"), "utf-8"
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace"), "utf-8"
+
+
 class TextViewer(tk.Toplevel):
     """应用内文本查看器。
 
     杀软/沙箱环境里启动记事本可能被拦，用户点了链接却什么都没看到；
     这里先把内容直接显示出来，能不能调外部程序只是附加能力。
+    预览结果还可以在这里转简繁、再保存到歌曲目录。
     """
 
     def __init__(self, master, title: str, content: str, path: Path | None = None,
-                 save_path: Path | None = None, on_saved=None):
+                 save_path: Path | None = None, on_saved=None, encoding: str = "utf-8"):
         super().__init__(master)
+        self.base_title = title
         self.title(title)
         self.configure(bg=BG)
         self.geometry("780x560")
@@ -238,6 +253,9 @@ class TextViewer(tk.Toplevel):
         self.path = path
         self.save_path = save_path
         self.on_saved = on_saved
+        self.encoding = encoding
+        self.content = content
+        self.form_label = ""
 
         wrap = ttk.Frame(self, padding=10)
         wrap.pack(fill="both", expand=True)
@@ -247,16 +265,16 @@ class TextViewer(tk.Toplevel):
         ttk.Label(wrap, text=str(path) if path else "",
                   foreground=MUTED).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        text = tk.Text(wrap, wrap="none", bg="#151515", fg=WHITE, insertbackground=WHITE,
-                       relief="flat", font=("Consolas", 10), padx=8, pady=6)
-        text.grid(row=1, column=0, sticky="nsew")
-        text.insert("1.0", content)
-        text.configure(state="disabled")
-        yscroll = ttk.Scrollbar(wrap, orient="vertical", command=text.yview)
+        self.text = tk.Text(wrap, wrap="none", bg="#151515", fg=WHITE, insertbackground=WHITE,
+                            relief="flat", font=("Consolas", 10), padx=8, pady=6)
+        self.text.grid(row=1, column=0, sticky="nsew")
+        self.text.insert("1.0", content)
+        self.text.configure(state="disabled")
+        yscroll = ttk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
         yscroll.grid(row=1, column=1, sticky="ns")
-        xscroll = ttk.Scrollbar(wrap, orient="horizontal", command=text.xview)
+        xscroll = ttk.Scrollbar(wrap, orient="horizontal", command=self.text.xview)
         xscroll.grid(row=2, column=0, sticky="ew")
-        text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
         bar = ttk.Frame(wrap)
         bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -265,21 +283,44 @@ class TextViewer(tk.Toplevel):
             ttk.Button(bar, text="用记事本打开",
                        command=self._open_external).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="复制全文",
-                   command=lambda: self._copy(content)).pack(side="right", padx=(0, 6))
+                   command=self._copy).pack(side="right", padx=(0, 6))
         if save_path is not None:
             self.save_button = ttk.Button(bar, text="保存到歌曲目录", command=self._save)
-            self.save_button.pack(side="left")
+            self.save_button.pack(side="right", padx=(0, 6))
+            ttk.Button(bar, text="转简体",
+                       command=lambda: self._convert("simplified")).pack(side="left")
+            ttk.Button(bar, text="转繁体",
+                       command=lambda: self._convert("traditional")).pack(side="left", padx=(6, 0))
 
-    def _copy(self, content: str) -> None:
+    def _copy(self) -> None:
         self.clipboard_clear()
-        self.clipboard_append(content)
+        self.clipboard_append(self.content)
 
     def _open_external(self) -> None:
         if self.path is not None and not open_with_notepad(self.path):
             messagebox.showerror(APP_TITLE, f"系统不允许启动记事本，可以直接看这个窗口里的内容。\n{self.path}")
 
+    def _set_content(self, text: str) -> None:
+        self.content = text
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", text)
+        self.text.configure(state="disabled")
+
+    def _convert(self, form: str) -> None:
+        """只在预览窗口提供：转完可以再点保存。"""
+        converted = core.convert_text(self.content, form)
+        label = "简体" if form == "simplified" else "繁体"
+        if converted == self.content:
+            self.form_label = label
+            self.title(f"{self.base_title} · 已是{label}")
+            return
+        self._set_content(converted)
+        self.form_label = label
+        self.title(f"{self.base_title} · 已转{label}（未保存）")
+
     def _save(self) -> None:
-        """把预览内容原样写到歌曲目录；不计入“成功”统计。"""
+        """把预览内容写到歌曲目录；不计入“成功”统计。"""
         if self.path is None or self.save_path is None:
             return
         target = self.save_path
@@ -287,7 +328,16 @@ class TextViewer(tk.Toplevel):
                 APP_TITLE, f"{target.name} 已存在，覆盖？", parent=self):
             return
         try:
-            shutil.copyfile(self.path, target)
+            payload = self.content.encode(self.encoding)
+        except (UnicodeEncodeError, LookupError):
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"当前内容无法用 {self.encoding.upper()} 保存（含该编码没有的字符）。\n改用 UTF-8 保存？",
+                    parent=self):
+                return
+            payload = self.content.encode("utf-8")
+        try:
+            target.write_bytes(payload)
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"保存失败：{exc}", parent=self)
             return
@@ -679,14 +729,14 @@ class LrcApp:
     def _open_preview_file(self, path) -> None:
         target = Path(path)
         try:
-            content = target.read_text(encoding="utf-8", errors="replace")
+            content, encoding = read_text_file(target)
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"无法读取预览文件：{exc}")
             return
-        # 预览结果可以顺手保存到歌曲目录；已生成的文件不需要这个按钮
+        # 预览结果可以顺手转简繁、保存到歌曲目录；已生成的文件不需要这些按钮
         save_path = self._preview_targets.get(str(target))
         TextViewer(self.root, f"预览 - {target.name}", content, target,
-                   save_path=save_path, on_saved=self._on_preview_saved)
+                   save_path=save_path, on_saved=self._on_preview_saved, encoding=encoding)
 
     def _on_preview_saved(self, target: Path) -> None:
         self._log("info", f"已保存到歌曲目录：{target}（不计入成功统计）")
