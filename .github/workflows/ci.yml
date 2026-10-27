@@ -6,6 +6,11 @@ on:
       - main
   pull_request:
 
+env:
+  # Windows runner 默认代码页是 cp1252，中文帮助文本写进管道会直接抛
+  # UnicodeEncodeError；强制 UTF-8，和 .cmd 启动器里的设置保持一致。
+  PYTHONUTF8: "1"
+
 jobs:
   check:
     runs-on: windows-latest

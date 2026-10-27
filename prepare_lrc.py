@@ -754,7 +754,24 @@ def nonnegative_chars(value):
     return value
 
 
+def secure_output() -> None:
+    """把输出改成能容纳中文的编码。
+
+    Windows 旧代码页（如 CI 的 cp1252）下把中文写进管道/重定向会直接抛
+    UnicodeEncodeError；非交互输出统一改用 UTF-8 并容错，交互式控制台保持原样。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def main():
+    secure_output()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     try:
         from version import __version__ as app_version
