@@ -143,185 +143,47 @@ class CheckItem(tk.Frame):
                                  fg=GREEN if checked else MUTED)
 
 
-class FolderPickerDialog(tk.Toplevel):
-    """选目录时顺便列出里面的音频文件。
-
-    系统自带的 askdirectory 只显示文件夹，用户看不出这个目录里到底有没有歌；
-    这里把子目录和音频文件一起列出，并显示本目录/含子目录的音频数量。
-    """
-
-    def __init__(self, master, initial: Path):
-        super().__init__(master)
-        self.title("选择音乐目录")
-        self.configure(bg=BG)
-        self.transient(master)
-        self.minsize(660, 440)
-        self.geometry("760x480")
-        self.result: Path | None = None
-        self.path = initial if initial.is_dir() else Path.home()
-        self.current_files = 0
-        self._count_token = 0
-        self._count_queue: queue.Queue = queue.Queue()
-        self._build_widgets()
-        self._navigate(self.path)
-        self.grab_set()
-        self.bind("<Escape>", lambda _event: self._cancel())
-        self.after(120, self._poll_count)
-
-    # ------------------------------------------------------------
-    def _build_widgets(self) -> None:
-        wrap = ttk.Frame(self, padding=10)
-        wrap.pack(fill="both", expand=True)
-        wrap.columnconfigure(0, weight=1)
-        wrap.rowconfigure(2, weight=1)
-
-        bar = ttk.Frame(wrap)
-        bar.grid(row=0, column=0, sticky="ew")
-        bar.columnconfigure(1, weight=1)
-        ttk.Button(bar, text="上一级", command=self._go_up).grid(row=0, column=0, padx=(0, 6))
-        self.path_var = tk.StringVar()
-        entry = ttk.Entry(bar, textvariable=self.path_var)
-        entry.grid(row=0, column=1, sticky="ew")
-        entry.bind("<Return>", self._on_entry_return)
-
-        ttk.Label(wrap, text="双击文件夹进入；双击音频文件即选中它所在的目录",
-                  foreground=MUTED).grid(row=1, column=0, sticky="w", pady=(6, 4))
-
-        body = ttk.Frame(wrap)
-        body.grid(row=2, column=0, sticky="nsew")
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(body, columns=("size",), show="tree headings",
-                                 selectmode="browse", height=12)
-        self.tree.heading("#0", text="名称", anchor="w")
-        self.tree.heading("size", text="大小", anchor="e")
-        self.tree.column("#0", width=470, minwidth=280, anchor="w", stretch=True)
-        self.tree.column("size", width=100, minwidth=90, anchor="e", stretch=False)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        self.tree.tag_configure("dir", foreground=GREEN)
-        self.tree.tag_configure("file", foreground=MUTED)
-        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.bind("<Double-1>", self._on_activate)
-        self.tree.bind("<Return>", self._on_activate)
-
-        self.status = ttk.Label(wrap, text="", foreground=MUTED)
-        self.status.grid(row=3, column=0, sticky="w", pady=(6, 0))
-
-        btns = ttk.Frame(wrap)
-        btns.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(btns, text="取消", command=self._cancel).pack(side="right")
-        ttk.Button(btns, text="选择此文件夹", command=self._accept).pack(side="right", padx=(0, 6))
-
-    # ------------------------------------------------------------
-    def _navigate(self, path: Path) -> None:
-        try:
-            entries = list(path.iterdir())
-        except OSError as exc:
-            messagebox.showerror("选择音乐目录", f"无法读取目录：{exc}", parent=self)
-            return
-        self.path = path
-        self.path_var.set(str(path))
-        self.tree.delete(*self.tree.get_children())
-        if path.parent != path:
-            self.tree.insert("", "end", iid="..", text="..（上一级）", values=("",), tags=("dir",))
-        dirs = sorted((item for item in entries if item.is_dir() and not item.is_symlink()),
-                      key=lambda item: item.name.casefold())
-        files = sorted((item for item in entries
-                        if item.is_file() and not item.is_symlink()
-                        and item.suffix.casefold() in core.AUDIO_SUFFIXES),
-                       key=lambda item: item.name.casefold())
-        for item in dirs:
-            self.tree.insert("", "end", iid=str(item), text=item.name, values=("",), tags=("dir",))
-        for item in files:
-            try:
-                megabytes = item.stat().st_size / 1048576
-            except OSError:
-                megabytes = 0.0
-            self.tree.insert("", "end", iid=str(item), text=item.name,
-                             values=(f"{megabytes:.1f} MB",), tags=("file",))
-        self.current_files = len(files)
-        self.status.configure(text=f"本目录 {len(files)} 个音频 · 含子目录统计中…")
-        self._start_recursive_count(path)
-
-    def _start_recursive_count(self, root: Path) -> None:
-        self._count_token += 1
-        token = self._count_token
-        suffixes = core.AUDIO_SUFFIXES
-
-        def work() -> None:
-            total = 0
-            truncated = False
-            for _dirpath, _dirnames, filenames in os.walk(root):
-                total += sum(1 for name in filenames if Path(name).suffix.casefold() in suffixes)
-                if total > 20000 or token != self._count_token:
-                    truncated = total > 20000
-                    break
-            self._count_queue.put((token, total, truncated))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _poll_count(self) -> None:
-        try:
-            while True:
-                token, total, truncated = self._count_queue.get_nowait()
-                if token == self._count_token and self.winfo_exists():
-                    suffix = "+" if truncated else ""
-                    self.status.configure(
-                        text=f"本目录 {self.current_files} 个音频 · 含子目录 {total}{suffix} 个")
-        except queue.Empty:
-            pass
-        if self.winfo_exists():
-            self.after(150, self._poll_count)
-
-    # ------------------------------------------------------------
-    def _go_up(self) -> None:
-        if self.path.parent != self.path:
-            self._navigate(self.path.parent)
-
-    def _on_entry_return(self, _event=None) -> None:
-        candidate = Path(self.path_var.get().strip())
-        if candidate.is_dir():
-            self._navigate(candidate)
-        else:
-            messagebox.showerror("选择音乐目录", "路径不存在或不是文件夹。", parent=self)
-
-    def _on_activate(self, _event=None) -> None:
-        item = self.tree.focus()
-        if not item:
-            return
-        if item == "..":
-            self._go_up()
-            return
-        target = Path(item)
-        if target.is_dir():
-            self._navigate(target)
-        else:
-            self._accept()
-
-    def _accept(self) -> None:
-        self.result = self.path
-        self.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.destroy()
-
-
 def open_in_explorer(path: Path) -> bool:
     """打开资源管理器窗口。
 
-    os.startfile 走 shell 关联，个别机器上对目录会抛 WinError 5；
-    失败时退回 explorer.exe —— 它一定能打开，只是退出码不可信，所以不看返回码。
+    依次尝试 os.startfile（走 shell 关联）和 Shell.Application COM 的 Explore。
+    不启动 explorer.exe：程序以管理员身份运行时，新起的 explorer 会因拒绝提权
+    而报 0xC0000142「应用程序无法正常启动」，用户只会看到一个莫名其妙的错误框。
     """
     try:
         os.startfile(str(path))
         return True
     except OSError:
         pass
+    return explore_via_shell(path)
+
+
+def explore_via_shell(path: Path) -> bool:
+    """让已经在跑的资源管理器打开目录，不创建新进程。
+
+    通过 PowerShell 调 Shell.Application COM，路径经环境变量传递，
+    免得中文或引号在命令行里被二次转义。
+    """
+    script = ("$ErrorActionPreference = 'Stop'; "
+              "$shell = New-Object -ComObject Shell.Application; "
+              "$shell.Explore($env:PEBBY_OPEN_PATH)")
+    env = os.environ.copy()
+    env["PEBBY_OPEN_PATH"] = str(path)
     try:
-        subprocess.Popen(["explorer", str(path)])
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            env=env, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def open_with_notepad(path: Path) -> bool:
+    """用记事本打开文件（预览结果是临时文件，双击关联不一定可用）。"""
+    try:
+        subprocess.Popen(["notepad.exe", str(path)],
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return True
     except OSError:
         return False
@@ -360,7 +222,9 @@ class LrcApp:
         self.encoding_var = tk.StringVar(value="utf-8")
         self.name_format_var = tk.StringVar(value=core.NAME_FORMATS[core.DEFAULT_NAME_FORMAT])
         self.format_vars = {suffix: tk.BooleanVar(value=True) for suffix, _ in FORMAT_OPTIONS}
-        self.check_updates_var = tk.BooleanVar(value=True)
+        self.check_updates_var = tk.BooleanVar(value=False)
+        self._link_seq = 0
+        self.preview_dir: Path | None = None
 
         self._build_style()
         self._build_ui()
@@ -548,7 +412,7 @@ class LrcApp:
             self.credits_var.set(bool(data.get("credits", False)))
             self.convert_var.set(bool(data.get("convert", False)))
             self.preview_var.set(bool(data.get("preview", False)))
-            self.check_updates_var.set(bool(data.get("check_updates", True)))
+            self.check_updates_var.set(bool(data.get("check_updates", False)))
             if data.get("name_format") in core.NAME_FORMATS:
                 self.name_format_var.set(core.NAME_FORMATS[data["name_format"]])
             if isinstance(data.get("dismissed_version"), str):
@@ -675,6 +539,45 @@ class LrcApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _log_link(self, text: str, target, opener) -> None:
+        """写一行可点击的日志，点一下就用 opener(target) 打开。"""
+        self.log_text.configure(state="normal")
+        start = self.log_text.index("end-1c")
+        self.log_text.insert("end", text + "\n", "info")
+        end = self.log_text.index("end-1c")
+        tag = f"link{self._link_seq}"
+        self._link_seq += 1
+        self.log_text.tag_add(tag, start, end)
+        self.log_text.tag_configure(tag, foreground=CYAN, underline=True)
+        self.log_text.tag_bind(tag, "<Button-1>", lambda _event, item=target: opener(item))
+        self.log_text.tag_bind(tag, "<Enter>",
+                               lambda _event: self.log_text.configure(cursor="hand2"))
+        self.log_text.tag_bind(tag, "<Leave>",
+                               lambda _event: self.log_text.configure(cursor=""))
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _open_preview_file(self, path) -> None:
+        if not open_with_notepad(Path(path)):
+            messagebox.showerror(APP_TITLE, f"无法用记事本打开：{path}")
+
+    def _open_preview_dir(self, path) -> None:
+        if not open_in_explorer(Path(path)):
+            messagebox.showerror(APP_TITLE, f"无法打开目录：{path}")
+
+    def _prune_previews(self, keep_days: int = 7) -> None:
+        """清掉 7 天前的预览目录，避免越攒越多。"""
+        base = app_data_dir() / "preview"
+        if not base.is_dir():
+            return
+        cutoff = datetime.now().timestamp() - keep_days * 86400
+        for item in base.iterdir():
+            try:
+                if item.is_dir() and item.stat().st_mtime < cutoff:
+                    shutil.rmtree(item, ignore_errors=True)
+            except OSError:
+                continue
+
     def _clear_log(self) -> None:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
@@ -684,19 +587,33 @@ class LrcApp:
     # 文件夹/按钮
     # ------------------------------------------------------------
     def _choose_folder(self) -> None:
-        initial = Path(self.folder_var.get().strip() or str(Path.home() / "Desktop"))
-        dialog = FolderPickerDialog(self.root, initial)
-        self.root.wait_window(dialog)
-        if dialog.result:
-            self.folder_var.set(str(dialog.result))
+        current = self.folder_var.get().strip()
+        initial = current if Path(current).is_dir() else str(Path.home() / "Desktop")
+        patterns = " ".join(f"*{suffix}" for suffix in sorted(core.AUDIO_SUFFIXES))
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择音乐目录：选中音频文件即用其所在目录，也可在文件名框直接输入路径",
+            initialdir=initial,
+            filetypes=[("音频文件", patterns), ("所有文件", "*.*")])
+        if not chosen:
+            return
+        picked = Path(chosen)
+        # 选到文件就用它所在的目录；选到目录（手输路径时可能）就直接用
+        self.folder_var.set(str(picked if picked.is_dir() else picked.parent))
 
     def _open_folder(self) -> None:
         folder = Path(self.folder_var.get().strip())
         if not folder.is_dir():
             messagebox.showerror(APP_TITLE, "请先选择有效的音乐目录。")
             return
-        if not open_in_explorer(folder):
-            messagebox.showerror(APP_TITLE, f"无法打开目录：{folder}\n可以复制这个路径，手动在资源管理器里打开。")
+        if open_in_explorer(folder):
+            return
+        # 打不开至少让路径可复制：管理员运行时 shell 关联可能整个不可用
+        self.root.clipboard_clear()
+        self.root.clipboard_append(str(folder))
+        messagebox.showwarning(
+            APP_TITLE,
+            f"无法打开目录，路径已复制到剪贴板：\n{folder}\n\n可以粘贴到资源管理器地址栏。")
 
     def _set_running(self, running: bool, mode: str = "generate") -> None:
         self.running = running
@@ -745,8 +662,19 @@ class LrcApp:
         self._set_running(True, "generate")
         self.cancel_event.clear()
         self._log("info", f"开始扫描：{folder}")
+        self.preview_dir = None
         if self.preview_var.get():
-            self._log("warn", "预览模式：只查询和校验，不会写入任何 .lrc 文件。")
+            self._log("warn", "预览模式：只查询和校验，不会写入音乐目录里的 .lrc。")
+            self.preview_dir = (app_data_dir() / "preview"
+                                / datetime.now().strftime("%Y%m%d-%H%M%S"))
+            self._prune_previews()
+            try:
+                self.preview_dir.mkdir(parents=True, exist_ok=True)
+                self._log_link(f"预览文件会写到 {self.preview_dir}（点击打开该目录）",
+                               self.preview_dir, self._open_preview_dir)
+            except OSError as exc:
+                self._log("warn", f"无法创建预览目录：{exc}")
+                self.preview_dir = None
         name_format = next((key for key, label in core.NAME_FORMATS.items()
                             if label == self.name_format_var.get()), core.DEFAULT_NAME_FORMAT)
         if name_format != core.DEFAULT_NAME_FORMAT:
@@ -756,6 +684,7 @@ class LrcApp:
             self.overwrite_var.get(), self.credits_var.get(), self.convert_var.get(),
             self.preview_var.get(), duration, end_tolerance, max_line,
             self.source_var.get(), self.encoding_var.get(), name_format,
+            self.preview_dir,
         )
         self.worker = threading.Thread(target=self._generate_worker, args=args, daemon=True)
         self.worker.start()
@@ -764,7 +693,8 @@ class LrcApp:
                          prefer: str, overwrite: bool, credits: bool, convert: bool,
                          preview: bool, duration: float, end_tolerance: float,
                          max_line: int, source: str, encoding: str,
-                         name_format: str = core.DEFAULT_NAME_FORMAT) -> None:
+                         name_format: str = core.DEFAULT_NAME_FORMAT,
+                         preview_dir: Path | None = None) -> None:
         errors: list[str] = []
         results: list[dict] = []
         try:
@@ -779,7 +709,8 @@ class LrcApp:
                         path, encoding, preview, 15, source=source, prefer=prefer,
                         convert=convert, max_line_chars=max_line, drop_credits=credits,
                         overwrite=overwrite, duration_tolerance=duration,
-                        end_time_tolerance=end_tolerance, name_format=name_format)
+                        end_time_tolerance=end_tolerance, name_format=name_format,
+                        preview_dir=preview_dir)
                 except Exception as exc:  # 单首异常不应中断整批
                     result = {"status": "error", "audio": str(path),
                               "message": f"处理失败: {type(exc).__name__}: {exc}"}
@@ -930,6 +861,12 @@ class LrcApp:
         elif status == "dry_run":
             self._log("success", f"{name} 预览完成（未写文件）")
             self._log_result_detail(result)
+            if result.get("preview_path"):
+                self._log_link(
+                    f"  预览文件：{Path(result['preview_path']).name}（点击用记事本打开）",
+                    result["preview_path"], self._open_preview_file)
+            if result.get("preview_error"):
+                self._log("warn", f"  {result['preview_error']}")
         elif status == "exists":
             self._log("warn", f"{name} 已存在，跳过（不覆盖）")
         else:
@@ -968,6 +905,9 @@ class LrcApp:
         summary = prefix + "，".join(parts)
         self.summary_label.configure(text=f"完成：{summary}")
         self._log("summary", f"全部完成：{summary}")
+        if previewed and self.preview_dir is not None:
+            self._log_link(f"预览文件目录：{self.preview_dir}（点击打开）",
+                           self.preview_dir, self._open_preview_dir)
         for error in errors:
             self._log("warn", f"扫描警告：{error}")
         self._save_settings()

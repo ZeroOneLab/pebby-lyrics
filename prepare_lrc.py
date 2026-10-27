@@ -537,6 +537,17 @@ def output_path(audio_path, track, name_format=DEFAULT_NAME_FORMAT):
     return audio_path.with_name(stem + ".lrc")
 
 
+def preview_target(directory, name):
+    """预览文件名重复时追加序号，避免覆盖同一次运行里的同名文件。"""
+    candidate = Path(directory) / name
+    stem, suffix = candidate.stem, candidate.suffix
+    counter = 2
+    while candidate.exists():
+        candidate = Path(directory) / f"{stem} ({counter}){suffix}"
+        counter += 1
+    return candidate
+
+
 def write_exclusive(path, payload):
     # x 模式避免检查后出现新文件时覆盖；磁盘满或中断时清掉本次创建的半文件。
     stream = path.open("xb")
@@ -702,7 +713,7 @@ def split_long_lines(lrc, track, max_chars):
 def process_file(path, encoding, dry_run, timeout, source="auto", prefer="simplified", convert=False,
                  max_line_chars=DEFAULT_MAX_LINE_CHARS, drop_credits=False, overwrite=False,
                  duration_tolerance=DURATION_TOLERANCE, end_time_tolerance=END_TIME_TOLERANCE,
-                 name_format=DEFAULT_NAME_FORMAT):
+                 name_format=DEFAULT_NAME_FORMAT, preview_dir=None):
     result = {"audio": str(path), "encoding": encoding, "overwrite": overwrite,
               "name_format": name_format}
     try:
@@ -765,6 +776,16 @@ def process_file(path, encoding, dry_run, timeout, source="auto", prefer="simpli
             return result
         if dry_run:
             result.update(status="dry_run", message=result["message"] + "；预览未写文件")
+            if preview_dir is not None:
+                # 预览文件写到指定目录，方便直接在记事本里核对
+                try:
+                    directory = Path(preview_dir)
+                    directory.mkdir(parents=True, exist_ok=True)
+                    preview = preview_target(directory, target.name)
+                    preview.write_bytes(payload)
+                    result["preview_path"] = str(preview)
+                except OSError as exc:
+                    result["preview_error"] = f"预览文件写入失败: {exc}"
             return result
         try:
             if overwrite:
@@ -853,6 +874,8 @@ def main():
     parser.add_argument("--max-line-chars", type=nonnegative_chars, default=DEFAULT_MAX_LINE_CHARS,
                         help=f"长句拆分阈值（字符），默认 {DEFAULT_MAX_LINE_CHARS}；0 不拆分")
     parser.add_argument("--dry-run", action="store_true", help="查询并校验，但不写 LRC")
+    parser.add_argument("--preview-dir", type=Path,
+                        help="配合 --dry-run：把预览内容写到该目录，便于用记事本核对")
     parser.add_argument("--report", type=Path, help="可选的 UTF-8 JSON 结果报告（不含歌词正文）")
     parser.add_argument("--timeout", type=positive_timeout, default=15, help="单次请求超时秒数，默认 15")
     args = parser.parse_args()
@@ -881,9 +904,12 @@ def main():
         for path in files:
             result = process_file(path, args.encoding, args.dry_run, args.timeout, args.source,
                                   prefer, convert, args.max_line_chars, drop_credits,
-                                  overwrite=args.overwrite, name_format=args.name_format)
+                                  overwrite=args.overwrite, name_format=args.name_format,
+                                  preview_dir=args.preview_dir)
             results.append(result)
             print(f"[{result['status']}] {path.name}: {result['message']}")
+            if result.get("preview_path"):
+                print(f"  预览: {result['preview_path']}")
             selected = result.get("selected")
             if selected:
                 print(f"  {selected['provider']} ID={selected['id']} | {selected['artist']} - {selected['title']} | 专辑={selected['album']} | 时长差={selected['duration_delta']:.3f}s | {result['line_count']} 行")
@@ -901,6 +927,7 @@ def main():
                   "convert": convert, "max_line_chars": args.max_line_chars,
                   "drop_credits": drop_credits, "overwrite": args.overwrite,
                   "name_format": args.name_format,
+                  "preview_dir": str(args.preview_dir) if args.preview_dir else None,
                   "dry_run": args.dry_run, "summary": summary,
                   "scan_errors": errors, "results": results}
         try:
