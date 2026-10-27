@@ -34,6 +34,15 @@ QQ_SMARTBOX_API = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg"
 QQ_LYRIC_API = "https://i.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg"
 QQ_HEADERS = {"Referer": "https://y.qq.com/", "User-Agent": "Mozilla/5.0 (compatible; Pebby-Lyrics/1.2)"}
 AUDIO_SUFFIXES = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav"}
+# 输出文件名格式：same 是唯一能被“按音频文件名找侧车”的播放器识别的格式。
+NAME_FORMATS = {
+    "same": "与音频同名",
+    "title": "歌名",
+    "title-artist": "歌名 - 歌手",
+    "artist-title": "歌手 - 歌名",
+    "track-title": "序号 歌名",
+}
+DEFAULT_NAME_FORMAT = "same"
 # 允许不同抓取源的结尾时间线差异；仍按差值排序，优先更接近的版本。
 DURATION_TOLERANCE = 8.0
 END_TIME_TOLERANCE = 15.0
@@ -53,6 +62,7 @@ class Track:
     album: str
     duration: float
     metadata_source: str
+    number: int = 0
 
 
 @lru_cache(maxsize=1)
@@ -71,6 +81,12 @@ def text_form(lrc):
     body = "\n".join(line[match.end():] for line in lrc.splitlines()
                      if (match := TIMESTAMP.match(line)))
     return "traditional-or-mixed" if chinese_converter().convert(body) != body else "simplified-compatible"
+
+
+def track_number(text):
+    """从 tracknumber / TRCK 的 "3/12" 这类文本里取音轨号，取不到返回 0。"""
+    match = re.match(r"\s*(\d{1,3})", str(text or ""))
+    return int(match.group(1)) if match else 0
 
 
 def read_track(path):
@@ -101,6 +117,7 @@ def read_track(path):
     title = tag_text("title", "TIT2")
     artist = tag_text("artist", "TPE1", multiple=True)
     album = tag_text("album", "TALB")
+    number = track_number(tag_text("tracknumber", "TRCK", "track"))
     source = "tags" if title and artist else "tags+filename"
     # 只接受有明确分隔符的“歌手 - 歌名”，不猜测普通空格的含义。
     parts = re.split(r"\s+[-–—]\s+", path.stem, maxsplit=1)
@@ -113,7 +130,7 @@ def read_track(path):
     duration = float(audio.info.length)
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("音频时长无效，不能可靠校验歌词版本")
-    return Track(path, title, artist, album, duration, source)
+    return Track(path, title, artist, album, duration, source, number)
 
 
 def fetch_json(endpoint, params, timeout, body=None, headers=None):
@@ -492,6 +509,34 @@ def existing_lrc(audio_path):
     return next((item for item in audio_path.parent.iterdir() if item.name.casefold() == name), None)
 
 
+INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+
+
+def safe_component(text, limit=80):
+    """把标签文本清洗成 Windows 可用文件名片段；非法字符替换为下划线。"""
+    cleaned = INVALID_NAME_CHARS.sub("_", str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned[:limit].rstrip(" .")
+
+
+def output_path(audio_path, track, name_format=DEFAULT_NAME_FORMAT):
+    """按所选格式给出 LRC 目标路径；默认与音频同目录同名。"""
+    if name_format not in NAME_FORMATS or name_format == "same":
+        return audio_path.with_suffix(".lrc")
+    title = safe_component(track.title)
+    artist = safe_component(track.artist)
+    if name_format == "title":
+        stem = title
+    elif name_format == "title-artist":
+        stem = f"{title} - {artist}"
+    elif name_format == "artist-title":
+        stem = f"{artist} - {title}"
+    else:  # track-title
+        stem = f"{track.number:02d} {title}" if track.number else title
+    stem = safe_component(stem) or safe_component(audio_path.stem) or "lyrics"
+    return audio_path.with_name(stem + ".lrc")
+
+
 def write_exclusive(path, payload):
     # x 模式避免检查后出现新文件时覆盖；磁盘满或中断时清掉本次创建的半文件。
     stream = path.open("xb")
@@ -655,16 +700,31 @@ def split_long_lines(lrc, track, max_chars):
 
 
 def process_file(path, encoding, dry_run, timeout, source="auto", prefer="simplified", convert=False,
-                 max_line_chars=DEFAULT_MAX_LINE_CHARS, drop_credits=True, overwrite=False,
-                 duration_tolerance=DURATION_TOLERANCE, end_time_tolerance=END_TIME_TOLERANCE):
-    result = {"audio": str(path), "lrc": str(path.with_suffix(".lrc")), "encoding": encoding,
-              "overwrite": overwrite}
+                 max_line_chars=DEFAULT_MAX_LINE_CHARS, drop_credits=False, overwrite=False,
+                 duration_tolerance=DURATION_TOLERANCE, end_time_tolerance=END_TIME_TOLERANCE,
+                 name_format=DEFAULT_NAME_FORMAT):
+    result = {"audio": str(path), "encoding": encoding, "overwrite": overwrite,
+              "name_format": name_format}
     try:
-        existing = existing_lrc(path)
-        if existing is not None and not overwrite:
-            result.update(status="exists", message="已有同名 LRC，保留且不联网", lrc=str(existing))
-            return result
-        track = read_track(path)
+        track = None
+        if name_format == DEFAULT_NAME_FORMAT:
+            existing = existing_lrc(path)
+            if existing is not None and not overwrite:
+                result.update(status="exists", message="已有同名 LRC，保留且不联网", lrc=str(existing))
+                return result
+            target = path.with_suffix(".lrc")
+        else:
+            # 非同名格式要先读标签才能知道目标文件名
+            track = read_track(path)
+            target = output_path(path, track, name_format)
+            existing = next((item for item in (target, target.with_suffix(".LRC"), target.with_suffix(".Lrc"))
+                             if item.exists()), None)
+            if existing is not None and not overwrite:
+                result.update(status="exists", message=f"已有 {existing.name}，保留且不联网", lrc=str(existing))
+                return result
+        result["lrc"] = str(target)
+        if track is None:
+            track = read_track(path)
         result["local"] = {"title": track.title, "artist": track.artist, "album": track.album,
                            "duration": track.duration, "metadata_source": track.metadata_source}
         if not track.artist:
@@ -708,10 +768,10 @@ def process_file(path, encoding, dry_run, timeout, source="auto", prefer="simpli
             return result
         try:
             if overwrite:
-                write_replace(path.with_suffix(".lrc"), payload)
+                write_replace(target, payload)
                 result["overwritten"] = existing is not None
             else:
-                write_exclusive(path.with_suffix(".lrc"), payload)
+                write_exclusive(target, payload)
         except FileExistsError:
             result.update(status="exists", message="写入前已出现 LRC，保留且不覆盖")
             return result
@@ -784,7 +844,10 @@ def main():
     parser.add_argument("--prefer", choices=("simplified", "traditional"), default="simplified",
                         help="优先使用简体还是繁体来源；找不到时用另一种，默认简体")
     parser.add_argument("--keep-traditional", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--keep-credits", action="store_true", help="保留 QQ 片头的歌名/词曲信息行；默认移除")
+    parser.add_argument("--drop-credits", action="store_true", help="移除 QQ 片头的歌名/词曲信息行；默认保留")
+    parser.add_argument("--name-format", choices=tuple(NAME_FORMATS), default=DEFAULT_NAME_FORMAT,
+                        help="LRC 文件名格式：same 与音频同名（默认，按文件名找侧车时才可靠）；"
+                             "其余用标签重命名，可能不被播放器识别")
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有同名 LRC；默认跳过")
     parser.add_argument("--simplify", action="store_true", help="可选：选中后强制把文本转简体；默认只按优先级选择，不转换")
     parser.add_argument("--max-line-chars", type=nonnegative_chars, default=DEFAULT_MAX_LINE_CHARS,
@@ -795,7 +858,7 @@ def main():
     args = parser.parse_args()
     prefer = "traditional" if args.keep_traditional else args.prefer
     convert = args.simplify
-    drop_credits = not args.keep_credits
+    drop_credits = args.drop_credits
     root = args.root.expanduser().resolve()
     if not root.exists():
         parser.error(f"路径不存在: {root}")
@@ -811,13 +874,14 @@ def main():
           f"{'强制转简体' if convert else '保留来源文字'}；"
           f"行长≤{args.max_line_chars or '不限'}；"
           f"{'移除片头信息' if drop_credits else '保留片头信息'}；"
+          f"文件名={NAME_FORMATS.get(args.name_format, args.name_format)}；"
           f"{'覆盖已有 LRC' if args.overwrite else '已有 LRC 不覆盖'}")
     results = []
     try:
         for path in files:
             result = process_file(path, args.encoding, args.dry_run, args.timeout, args.source,
                                   prefer, convert, args.max_line_chars, drop_credits,
-                                  overwrite=args.overwrite)
+                                  overwrite=args.overwrite, name_format=args.name_format)
             results.append(result)
             print(f"[{result['status']}] {path.name}: {result['message']}")
             selected = result.get("selected")
@@ -836,6 +900,7 @@ def main():
                   "encoding": args.encoding, "source": args.source, "prefer": prefer,
                   "convert": convert, "max_line_chars": args.max_line_chars,
                   "drop_credits": drop_credits, "overwrite": args.overwrite,
+                  "name_format": args.name_format,
                   "dry_run": args.dry_run, "summary": summary,
                   "scan_errors": errors, "results": results}
         try:

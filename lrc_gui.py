@@ -162,10 +162,10 @@ class LrcApp:
         self.settings_path = app_data_dir() / "settings.json"
 
         self.folder_var = tk.StringVar()
-        self.recursive_var = tk.BooleanVar(value=True)
+        self.recursive_var = tk.BooleanVar(value=False)
         self.prefer_var = tk.StringVar(value="simplified")
         self.overwrite_var = tk.BooleanVar(value=False)
-        self.credits_var = tk.BooleanVar(value=True)
+        self.credits_var = tk.BooleanVar(value=False)
         self.convert_var = tk.BooleanVar(value=False)
         self.preview_var = tk.BooleanVar(value=False)
         self.duration_var = tk.DoubleVar(value=core.DURATION_TOLERANCE)
@@ -173,6 +173,7 @@ class LrcApp:
         self.max_line_var = tk.IntVar(value=core.DEFAULT_MAX_LINE_CHARS)
         self.source_var = tk.StringVar(value="auto")
         self.encoding_var = tk.StringVar(value="utf-8")
+        self.name_format_var = tk.StringVar(value=core.NAME_FORMATS[core.DEFAULT_NAME_FORMAT])
         self.format_vars = {suffix: tk.BooleanVar(value=True) for suffix, _ in FORMAT_OPTIONS}
         self.check_updates_var = tk.BooleanVar(value=True)
 
@@ -278,6 +279,14 @@ class LrcApp:
         CheckItem(advanced, text="启动时检查更新", variable=self.check_updates_var).pack(
             side="left")
 
+        naming = ttk.Frame(options)
+        naming.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(naming, text="文件名格式").pack(side="left")
+        ttk.Combobox(naming, width=14, state="readonly", textvariable=self.name_format_var,
+                     values=tuple(core.NAME_FORMATS.values())).pack(side="left", padx=(4, 8))
+        ttk.Label(naming, text="只有“与音频同名”能被按文件名查找歌词的播放器识别",
+                  foreground=MUTED).pack(side="left")
+
         actions = ttk.Frame(main)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.start_button = ttk.Button(actions, text="开始生成", command=self._start)
@@ -334,14 +343,16 @@ class LrcApp:
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if isinstance(data.get("folder"), str):
                 self.folder_var.set(data["folder"])
-            self.recursive_var.set(bool(data.get("recursive", True)))
+            self.recursive_var.set(bool(data.get("recursive", False)))
             if data.get("prefer") in {"simplified", "traditional"}:
                 self.prefer_var.set(data["prefer"])
             self.overwrite_var.set(bool(data.get("overwrite", False)))
-            self.credits_var.set(bool(data.get("credits", True)))
+            self.credits_var.set(bool(data.get("credits", False)))
             self.convert_var.set(bool(data.get("convert", False)))
             self.preview_var.set(bool(data.get("preview", False)))
             self.check_updates_var.set(bool(data.get("check_updates", True)))
+            if data.get("name_format") in core.NAME_FORMATS:
+                self.name_format_var.set(core.NAME_FORMATS[data["name_format"]])
             if isinstance(data.get("dismissed_version"), str):
                 self.dismissed_version = data["dismissed_version"]
             if isinstance(data.get("last_check"), str):
@@ -377,6 +388,8 @@ class LrcApp:
             "max_line": self.max_line_var.get(),
             "source": self.source_var.get(),
             "encoding": self.encoding_var.get(),
+            "name_format": next((key for key, label in core.NAME_FORMATS.items()
+                                 if label == self.name_format_var.get()), core.DEFAULT_NAME_FORMAT),
             "formats": [suffix for suffix, var in self.format_vars.items() if var.get()],
             "check_updates": self.check_updates_var.get(),
             "dismissed_version": self.dismissed_version,
@@ -535,11 +548,15 @@ class LrcApp:
         self._set_running(True, "generate")
         self.cancel_event.clear()
         self._log("info", f"开始扫描：{folder}")
+        name_format = next((key for key, label in core.NAME_FORMATS.items()
+                            if label == self.name_format_var.get()), core.DEFAULT_NAME_FORMAT)
+        if name_format != core.DEFAULT_NAME_FORMAT:
+            self._log("warn", "当前文件名格式不是“与音频同名”，按文件名找歌词的播放器可能识别不到。")
         args = (
             folder, formats, self.recursive_var.get(), self.prefer_var.get(),
             self.overwrite_var.get(), self.credits_var.get(), self.convert_var.get(),
             self.preview_var.get(), duration, end_tolerance, max_line,
-            self.source_var.get(), self.encoding_var.get(),
+            self.source_var.get(), self.encoding_var.get(), name_format,
         )
         self.worker = threading.Thread(target=self._generate_worker, args=args, daemon=True)
         self.worker.start()
@@ -547,7 +564,8 @@ class LrcApp:
     def _generate_worker(self, folder: Path, formats: set[str], recursive: bool,
                          prefer: str, overwrite: bool, credits: bool, convert: bool,
                          preview: bool, duration: float, end_tolerance: float,
-                         max_line: int, source: str, encoding: str) -> None:
+                         max_line: int, source: str, encoding: str,
+                         name_format: str = core.DEFAULT_NAME_FORMAT) -> None:
         errors: list[str] = []
         results: list[dict] = []
         try:
@@ -562,7 +580,7 @@ class LrcApp:
                         path, encoding, preview, 15, source=source, prefer=prefer,
                         convert=convert, max_line_chars=max_line, drop_credits=credits,
                         overwrite=overwrite, duration_tolerance=duration,
-                        end_time_tolerance=end_tolerance)
+                        end_time_tolerance=end_tolerance, name_format=name_format)
                 except Exception as exc:  # 单首异常不应中断整批
                     result = {"status": "error", "audio": str(path),
                               "message": f"处理失败: {type(exc).__name__}: {exc}"}

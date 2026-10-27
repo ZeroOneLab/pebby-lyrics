@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ToolArgs = @()
 )
@@ -165,7 +165,7 @@ try {
         if (-not $inputRoot) { $inputRoot = $defaultRoot }
         $arguments = @($inputRoot)
         Write-Host '默认 QQ 音乐优先、LRCLIB 兜底；优先简体来源，找不到时用繁体；不强制转换。'
-        Write-Host '默认移除片头信息，长句按 18 字拆分，已有 LRC 跳过。'
+        Write-Host '默认保留片头信息，长句按 18 字拆分，已有 LRC 跳过。'
         $prefer = [string](Read-Host '优先简体还是繁体？输入 S 或 T（默认 S）')
         if ($prefer.Trim() -ieq 'T') {
             $arguments += @('--prefer', 'traditional')
