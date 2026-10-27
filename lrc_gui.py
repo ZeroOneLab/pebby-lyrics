@@ -381,7 +381,7 @@ class LrcApp:
         self.settings_path = settings_dir() / "settings.json"
 
         self.folder_var = tk.StringVar()
-        self.scope_var = tk.StringVar(value="dir")
+        self.scope_var = tk.StringVar(value="file")
         self.picked_file: Path | None = None
         self.prefer_var = tk.StringVar(value="simplified")
         self.overwrite_var = tk.BooleanVar(value=False)
@@ -582,7 +582,7 @@ class LrcApp:
                 self.folder_var.set(data["folder"])
             # 旧的 settings 只有 recursive 布尔值，迁移成三种处理范围
             scope = data.get("scope")
-            if scope in {"dir", "recursive"}:
+            if scope in {"file", "dir", "recursive"}:
                 self.scope_var.set(scope)
             elif data.get("recursive"):
                 self.scope_var.set("recursive")
@@ -618,8 +618,7 @@ class LrcApp:
     def _save_settings(self) -> None:
         data = {
             "folder": self.folder_var.get().strip(),
-            # “当前文件”依赖本次选中的文件，不写进配置，下次按当前目录处理
-            "scope": "dir" if self.scope_var.get() == "file" else self.scope_var.get(),
+            "scope": self.scope_var.get(),
             "prefer": self.prefer_var.get(),
             "overwrite": self.overwrite_var.get(),
             "credits": self.credits_var.get(),
