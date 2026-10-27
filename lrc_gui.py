@@ -228,13 +228,16 @@ class TextViewer(tk.Toplevel):
     这里先把内容直接显示出来，能不能调外部程序只是附加能力。
     """
 
-    def __init__(self, master, title: str, content: str, path: Path | None = None):
+    def __init__(self, master, title: str, content: str, path: Path | None = None,
+                 save_path: Path | None = None, on_saved=None):
         super().__init__(master)
         self.title(title)
         self.configure(bg=BG)
         self.geometry("780x560")
         self.minsize(520, 360)
         self.path = path
+        self.save_path = save_path
+        self.on_saved = on_saved
 
         wrap = ttk.Frame(self, padding=10)
         wrap.pack(fill="both", expand=True)
@@ -263,6 +266,9 @@ class TextViewer(tk.Toplevel):
                        command=self._open_external).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="复制全文",
                    command=lambda: self._copy(content)).pack(side="right", padx=(0, 6))
+        if save_path is not None:
+            self.save_button = ttk.Button(bar, text="保存到歌曲目录", command=self._save)
+            self.save_button.pack(side="left")
 
     def _copy(self, content: str) -> None:
         self.clipboard_clear()
@@ -271,6 +277,23 @@ class TextViewer(tk.Toplevel):
     def _open_external(self) -> None:
         if self.path is not None and not open_with_notepad(self.path):
             messagebox.showerror(APP_TITLE, f"系统不允许启动记事本，可以直接看这个窗口里的内容。\n{self.path}")
+
+    def _save(self) -> None:
+        """把预览内容原样写到歌曲目录；不计入“成功”统计。"""
+        if self.path is None or self.save_path is None:
+            return
+        target = self.save_path
+        if target.exists() and not messagebox.askyesno(
+                APP_TITLE, f"{target.name} 已存在，覆盖？", parent=self):
+            return
+        try:
+            shutil.copyfile(self.path, target)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"保存失败：{exc}", parent=self)
+            return
+        self.save_button.configure(state="disabled", text="已保存")
+        if self.on_saved is not None:
+            self.on_saved(target)
 
 
 class LrcApp:
@@ -311,6 +334,8 @@ class LrcApp:
         self._link_seq = 0
         self.preview_dir: Path | None = None
         self._preview_dirs: list[Path] = []
+        self._preview_targets: dict[str, Path] = {}
+        self._seen_warnings: set[str] = set()
         self.disclaimer_accepted = False
 
         self._build_style()
@@ -658,7 +683,13 @@ class LrcApp:
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"无法读取预览文件：{exc}")
             return
-        TextViewer(self.root, f"预览 - {target.name}", content, target)
+        # 预览结果可以顺手保存到歌曲目录；已生成的文件不需要这个按钮
+        save_path = self._preview_targets.get(str(target))
+        TextViewer(self.root, f"预览 - {target.name}", content, target,
+                   save_path=save_path, on_saved=self._on_preview_saved)
+
+    def _on_preview_saved(self, target: Path) -> None:
+        self._log("info", f"已保存到歌曲目录：{target}（不计入成功统计）")
 
     def _copy_path(self, path) -> None:
         """目录链接不做“打开”，只把路径复制到剪贴板。"""
@@ -739,6 +770,8 @@ class LrcApp:
         self._clear_log()
         self.results = []
         self.summary = Counter()
+        self._preview_targets.clear()
+        self._seen_warnings.clear()
         self.total = 0
         self.done = 0
         self.scan_errors = []
@@ -975,6 +1008,8 @@ class LrcApp:
             self._log("success", f"{name} 预览完成（未写文件）")
             self._log_result_detail(result)
             if result.get("preview_path"):
+                if result.get("lrc"):
+                    self._preview_targets[str(result["preview_path"])] = Path(result["lrc"])
                 self._log_link(
                     f"  预览文件：{Path(result['preview_path']).name}（点击预览）",
                     result["preview_path"], self._open_preview_file)
@@ -998,6 +1033,9 @@ class LrcApp:
                 f"专辑匹配={'是' if selected.get('album_match') else '否'}  "
                 f"{result.get('line_count', 0)} 行")
         for warning in result.get("warnings", []):
+            if warning in self._seen_warnings:
+                continue
+            self._seen_warnings.add(warning)
             self._log("warn", f"  警告：{warning}")
 
     def _on_done(self, results: list[dict], errors: list[str], cancelled: bool) -> None:

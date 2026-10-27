@@ -12,7 +12,7 @@ import base64
 from functools import lru_cache
 import html
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 import math
@@ -88,6 +88,18 @@ def canonical(text):
     """比较时归一简繁/全半角/空白；保留 live/remix 等版本信息。"""
     text = chinese_converter().convert(text)
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text).casefold())
+
+
+# 标签里常见“06.心雨”“01 - 歌名”“03、歌名”这类曲目号前缀；只在后面跟着
+# 分隔符时才去掉，避免把 “7 Rings” 这种真歌名截断。
+TRACK_NUMBER_PREFIX = re.compile(r"^\s*\d{1,3}\s*[.\-、_]\s*")
+
+
+def clean_title(text):
+    """去掉曲目号前缀，供搜索和歌名比较使用。"""
+    original = str(text or "").strip()
+    cleaned = TRACK_NUMBER_PREFIX.sub("", original).strip()
+    return cleaned or original
 
 
 def text_form(lrc):
@@ -200,7 +212,7 @@ def candidate_info(record, track, duration_tolerance=DURATION_TOLERANCE):
     if synced is not None and not isinstance(synced, str):
         raise ValueError("同步歌词字段无效")
     reasons = []
-    if canonical(record["trackName"]) != canonical(track.title):
+    if canonical(clean_title(record["trackName"])) != canonical(clean_title(track.title)):
         reasons.append("歌名不一致（保留版本后缀）")
     if canonical(record["artistName"]) != canonical(track.artist):
         reasons.append("歌手不一致")
@@ -311,7 +323,7 @@ def qq_search_smartbox(query, timeout):
 
 
 def qq_search(track, timeout):
-    query = chinese_converter().convert(f"{track.artist} {track.title}")
+    query = chinese_converter().convert(f"{track.artist} {clean_title(track.title)}")
     errors = []
     try:
         records = qq_search_musicu(query, timeout)
@@ -462,7 +474,7 @@ def find_lyrics(track, timeout, source="auto", prefer="simplified",
         exact_preferred = False
         if track.album:
             try:
-                exact = fetch_json("/get", {"track_name": track.title, "artist_name": track.artist,
+                exact = fetch_json("/get", {"track_name": clean_title(track.title), "artist_name": track.artist,
                                    "album_name": track.album, "duration": round(track.duration)}, timeout)
                 if exact is not None:
                     add_safely(exact, "lrclib-get")
@@ -473,7 +485,7 @@ def find_lyrics(track, timeout, source="auto", prefer="simplified",
                 details["warnings"].append(f"LRCLIB 精确查询失败，尝试搜索: {exc}")
         if not exact_preferred:
             try:
-                records = fetch_json("/search", {"track_name": track.title, "artist_name": track.artist}, timeout)
+                records = fetch_json("/search", {"track_name": clean_title(track.title), "artist_name": track.artist}, timeout)
                 if not isinstance(records, list):
                     raise ValueError("返回的不是候选列表")
                 for record in records:
@@ -520,6 +532,23 @@ def find_lyrics(track, timeout, source="auto", prefer="simplified",
 def existing_lrc(audio_path):
     name = audio_path.with_suffix(".lrc").name.casefold()
     return next((item for item in audio_path.parent.iterdir() if item.name.casefold() == name), None)
+
+
+def filename_title(path):
+    """从文件名推歌名：去掉曲目号；“歌手 - 歌名”取后半段。"""
+    stem = clean_title(path.stem)
+    parts = re.split(r"\s+[-–—]\s+", stem, maxsplit=1)
+    if len(parts) == 2 and all(part.strip() for part in parts):
+        return parts[1].strip()
+    return stem
+
+
+def fallback_search_title(path, track):
+    """标签歌名没匹配上时，用文件名重试的候选标题；和原地址没有区别时返回空串。"""
+    candidate = filename_title(path)
+    if candidate and canonical(clean_title(candidate)) != canonical(clean_title(track.title)):
+        return candidate
+    return ""
 
 
 INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
@@ -756,6 +785,18 @@ def process_file(path, encoding, dry_run, timeout, source="auto", prefer="simpli
             return result
         status, message, text, details = find_lyrics(track, timeout, source, prefer,
                                                      duration_tolerance, end_time_tolerance)
+        if text is None and status in {"no_match", "no_synced", "invalid_lrc"}:
+            # 标签歌名可能带曲目号或写错，用文件名再试一次（只多一次请求）
+            fallback = fallback_search_title(path, track)
+            if fallback:
+                retry_status, retry_message, retry_text, retry_details = find_lyrics(
+                    replace(track, title=fallback), timeout, source, prefer,
+                    duration_tolerance, end_time_tolerance)
+                result["filename_retry"] = {"title": fallback, "status": retry_status}
+                if retry_text is not None:
+                    status, text = retry_status, retry_text
+                    message = f"{retry_message}（用文件名“{fallback}”重试后匹配）"
+                    details = retry_details
         result.update(details, status=status, message=message, prefer=prefer)
         if text is None:
             return result
