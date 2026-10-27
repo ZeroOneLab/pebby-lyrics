@@ -12,5 +12,6 @@ __pycache__/
 
 # 本地运行产物
 reports/
+_pebby_preview/
 *.log
 settings.json

@@ -179,6 +179,48 @@ def open_with_notepad(path: Path) -> bool:
         return False
 
 
+DISCLAIMER_TEXT = (
+    "本工具用于整理你自己已拥有的音乐，仅供个人学习与自用。\n\n"
+    "· 歌词文本的版权归原权利人所有。本工具只读取公开可访问的歌词接口，\n"
+    "  不提供音频下载，不绕过付费、登录或地区限制。\n"
+    "· 请遵守你所在地区的法律以及各音乐平台的服务条款；因使用本工具\n"
+    "  产生的任何后果由使用者自行承担。\n"
+    "· 本工具不收集个人信息。更新检查默认关闭，开启后也只请求版本号。"
+)
+
+
+class DisclaimerDialog(tk.Toplevel):
+    """首次启动的使用说明与免责声明。"""
+
+    def __init__(self, master, on_done):
+        super().__init__(master)
+        self.title("使用说明与免责声明")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(master)
+        self.on_done = on_done
+
+        wrap = ttk.Frame(self, padding=16)
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text=DISCLAIMER_TEXT, justify="left",
+                  foreground=FG).pack(anchor="w")
+        self.no_show_var = tk.BooleanVar(value=True)
+        CheckItem(wrap, text="下次启动不再显示", variable=self.no_show_var).pack(
+            anchor="w", pady=(14, 0))
+
+        bar = ttk.Frame(wrap)
+        bar.pack(fill="x", pady=(14, 0))
+        ttk.Button(bar, text="确定", command=self._accept).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self._accept)
+        self.bind("<Escape>", lambda _event: self._accept())
+        self.grab_set()
+
+    def _accept(self) -> None:
+        dont_show = bool(self.no_show_var.get())
+        self.destroy()
+        self.on_done(dont_show)
+
+
 class TextViewer(tk.Toplevel):
     """应用内文本查看器。
 
@@ -248,6 +290,7 @@ class LrcApp:
         self.checking_update = False
         self.dismissed_version = ""
         self.last_check_date = ""
+        self.current_root: Path | None = None
         self.settings_path = settings_dir() / "settings.json"
 
         self.folder_var = tk.StringVar()
@@ -268,12 +311,14 @@ class LrcApp:
         self._link_seq = 0
         self.preview_dir: Path | None = None
         self._preview_dirs: list[Path] = []
+        self.disclaimer_accepted = False
 
         self._build_style()
         self._build_ui()
         self._load_settings()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._poll_queue)
+        self.root.after(400, self._maybe_show_disclaimer)
         self.root.after(2500, self._auto_check_updates)
 
     # ------------------------------------------------------------
@@ -456,6 +501,7 @@ class LrcApp:
                 self.dismissed_version = data["dismissed_version"]
             if isinstance(data.get("last_check"), str):
                 self.last_check_date = data["last_check"]
+            self.disclaimer_accepted = bool(data.get("disclaimer", False))
             if isinstance(data.get("duration"), (int, float)):
                 self.duration_var.set(float(data["duration"]))
             if isinstance(data.get("end_tolerance"), (int, float)):
@@ -493,6 +539,7 @@ class LrcApp:
             "check_updates": self.check_updates_var.get(),
             "dismissed_version": self.dismissed_version,
             "last_check": self.last_check_date,
+            "disclaimer": self.disclaimer_accepted,
         }
         try:
             self.settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -504,6 +551,16 @@ class LrcApp:
     # ------------------------------------------------------------
     # 更新检查（只读公开 Releases，不自替换、不上报）
     # ------------------------------------------------------------
+    def _maybe_show_disclaimer(self) -> None:
+        if self.disclaimer_accepted:
+            return
+        DisclaimerDialog(self.root, self._accept_disclaimer)
+
+    def _accept_disclaimer(self, dont_show: bool) -> None:
+        if dont_show:
+            self.disclaimer_accepted = True
+            self._save_settings()
+
     def _auto_check_updates(self) -> None:
         if not self.check_updates_var.get():
             return
@@ -692,22 +749,29 @@ class LrcApp:
         self._set_running(True, "generate")
         self.cancel_event.clear()
         self._log("info", f"开始扫描：{folder}")
+        self.current_root = folder
         self._cleanup_previews()
         self.preview_dir = None
         if self.preview_var.get():
             self._log("warn", "预览模式：只查询和校验，不写正式的 .lrc。")
-            candidate = (folder / PREVIEW_DIR_NAME
-                         / datetime.now().strftime("%Y%m%d-%H%M%S"))
-            try:
-                candidate.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            # 预览是临时产物，优先生成在 exe 旁边，避免混进音乐库；
+            # exe 目录不可写时再退到音乐目录下。
+            last_error = ""
+            for base in (settings_dir(), folder):
+                candidate = base / PREVIEW_DIR_NAME / stamp
+                try:
+                    candidate.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    last_error = getattr(exc, "strerror", None) or str(exc)
+                    continue
                 self.preview_dir = candidate
                 self._preview_dirs.append(candidate)
                 self._log_link(f"预览文件会写到 {candidate}（点击复制路径）",
                                candidate, self._copy_path)
-            except OSError as exc:
-                reason = getattr(exc, "strerror", None) or str(exc)
-                self._log("warn", f"无法在音乐目录下创建预览目录 {candidate}：{reason}")
-                self.preview_dir = None
+                break
+            if self.preview_dir is None:
+                self._log("warn", f"没有可写的目录存放预览文件：{last_error}")
         name_format = next((key for key, label in core.NAME_FORMATS.items()
                             if label == self.name_format_var.get()), core.DEFAULT_NAME_FORMAT)
         if name_format != core.DEFAULT_NAME_FORMAT:
@@ -737,7 +801,7 @@ class LrcApp:
             for index, path in enumerate(files, 1):
                 if self.cancel_event.is_set():
                     break
-                self.queue.put(("current", path.name, index, len(files)))
+                self.queue.put(("current", str(path), index, len(files)))
                 try:
                     result = core.process_file(
                         path, encoding, preview, 15, source=source, prefer=prefer,
@@ -880,18 +944,33 @@ class LrcApp:
         for error in errors:
             self._log("warn", f"扫描警告：{error}")
 
-    def _on_current(self, name: str, index: int, total: int) -> None:
+    def _display_path(self, path) -> str:
+        """日志里显示相对音乐目录的路径，递归处理时才能分清同名文件。"""
+        target = Path(str(path))
+        if not str(target):
+            return ""
+        if self.current_root is not None:
+            try:
+                return str(target.relative_to(self.current_root))
+            except ValueError:
+                pass
+        return str(target)
+
+    def _on_current(self, path: str, index: int, total: int) -> None:
         self.progress_label.configure(text=f"{index - 1} / {total}")
-        self._log("info", f"当前正在生成 {name} 歌词中…")
+        self._log("info", f"当前正在生成 {self._display_path(path)} 歌词中…")
 
     def _on_result(self, result: dict, index: int, total: int) -> None:
-        name = Path(result.get("audio", "")).name
+        name = self._display_path(result.get("audio", ""))
         status = result.get("status", "error")
         self.summary[status] += 1
         if status == "saved":
             suffix = "（覆盖）" if result.get("overwritten") else ""
             self._log("success", f"{name} 生成成功{suffix}")
             self._log_result_detail(result)
+            if result.get("lrc"):
+                self._log_link(f"  已生成：{Path(result['lrc']).name}（点击预览）",
+                               result["lrc"], self._open_preview_file)
         elif status == "dry_run":
             self._log("success", f"{name} 预览完成（未写文件）")
             self._log_result_detail(result)
