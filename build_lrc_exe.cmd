@@ -29,7 +29,11 @@ if errorlevel 1 (
     )
 )
 
-for /f "delims=" %%V in ('"%PY%" -c "from version import __version__; print(__version__)"') do set "VER=%%V"
+rem Read the version through a temp file: nesting quotes inside for /f is fragile.
+"%PY%" -c "from version import __version__; print(__version__)" > "%TEMP%\pebby-lyrics-version.txt" 2>nul
+set "VER="
+set /p VER=<"%TEMP%\pebby-lyrics-version.txt"
+if not defined VER set "VER=unknown"
 
 echo [info] building Pebby-Lyrics v%VER% ...
 "%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name Pebby-Lyrics ^

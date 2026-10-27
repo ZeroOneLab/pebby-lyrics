@@ -239,7 +239,8 @@ class TextViewer(tk.Toplevel):
 
     杀软/沙箱环境里启动记事本可能被拦，用户点了链接却什么都没看到；
     这里先把内容直接显示出来，能不能调外部程序只是附加能力。
-    预览结果还可以在这里转简繁、再保存到歌曲目录。
+
+    预览结果（save_path 非空）允许直接改文字、转简繁，再保存到歌曲目录。
     """
 
     def __init__(self, master, title: str, content: str, path: Path | None = None,
@@ -255,7 +256,8 @@ class TextViewer(tk.Toplevel):
         self.on_saved = on_saved
         self.encoding = encoding
         self.content = content
-        self.form_label = ""
+        self.original = content
+        self.editable = save_path is not None
 
         wrap = ttk.Frame(self, padding=10)
         wrap.pack(fill="both", expand=True)
@@ -269,7 +271,11 @@ class TextViewer(tk.Toplevel):
                             relief="flat", font=("Consolas", 10), padx=8, pady=6)
         self.text.grid(row=1, column=0, sticky="nsew")
         self.text.insert("1.0", content)
-        self.text.configure(state="disabled")
+        self.text.edit_modified(False)
+        if not self.editable:
+            self.text.configure(state="disabled")
+        else:
+            self.text.bind("<<Modified>>", self._on_modified)
         yscroll = ttk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
         yscroll.grid(row=1, column=1, sticky="ns")
         xscroll = ttk.Scrollbar(wrap, orient="horizontal", command=self.text.xview)
@@ -284,64 +290,105 @@ class TextViewer(tk.Toplevel):
                        command=self._open_external).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="复制全文",
                    command=self._copy).pack(side="right", padx=(0, 6))
-        if save_path is not None:
+        if self.editable:
             self.save_button = ttk.Button(bar, text="保存到歌曲目录", command=self._save)
             self.save_button.pack(side="right", padx=(0, 6))
+            ttk.Button(bar, text="撤销修改",
+                       command=self._revert).pack(side="left", padx=(6, 0))
             ttk.Button(bar, text="转简体",
                        command=lambda: self._convert("simplified")).pack(side="left")
             ttk.Button(bar, text="转繁体",
                        command=lambda: self._convert("traditional")).pack(side="left", padx=(6, 0))
 
+    # ------------------------------------------------------------
+    def _current_text(self) -> str:
+        return self.text.get("1.0", "end-1c")
+
+    def _set_content(self, text: str) -> None:
+        self.content = text
+        state = self.text.cget("state")
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", text)
+        self.text.edit_modified(False)
+        self.text.configure(state=state)
+
+    def _on_modified(self, _event=None) -> None:
+        if not self.text.edit_modified():
+            return
+        self.text.edit_modified(False)
+        self.title(f"{self.base_title} · 已修改（未保存）")
+
     def _copy(self) -> None:
         self.clipboard_clear()
-        self.clipboard_append(self.content)
+        self.clipboard_append(self._current_text())
 
     def _open_external(self) -> None:
         if self.path is not None and not open_with_notepad(self.path):
             messagebox.showerror(APP_TITLE, f"系统不允许启动记事本，可以直接看这个窗口里的内容。\n{self.path}")
 
-    def _set_content(self, text: str) -> None:
-        self.content = text
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", text)
-        self.text.configure(state="disabled")
+    def _revert(self) -> None:
+        self._set_content(self.original)
+        self.title(self.base_title)
 
     def _convert(self, form: str) -> None:
-        """只在预览窗口提供：转完可以再点保存。"""
-        converted = core.convert_text(self.content, form)
+        """只在预览窗口提供：转完可以继续改或直接保存。"""
+        converted = core.convert_text(self._current_text(), form)
         label = "简体" if form == "simplified" else "繁体"
-        if converted == self.content:
-            self.form_label = label
+        if converted == self._current_text():
             self.title(f"{self.base_title} · 已是{label}")
             return
         self._set_content(converted)
-        self.form_label = label
         self.title(f"{self.base_title} · 已转{label}（未保存）")
 
+    def _bad_lines(self, text: str) -> list[str]:
+        bad = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if core.TIMESTAMP.match(stripped) or core.METADATA.match(stripped):
+                continue
+            bad.append(stripped)
+        return bad
+
     def _save(self) -> None:
-        """把预览内容写到歌曲目录；不计入“成功”统计。"""
+        """把（可能改过的）预览内容写到歌曲目录；不计入“成功”统计。"""
         if self.path is None or self.save_path is None:
             return
+        text = self._current_text()
+        if not text.strip():
+            messagebox.showwarning(APP_TITLE, "内容为空，没有保存。", parent=self)
+            return
+        bad = self._bad_lines(text)
+        if bad:
+            sample = "\n".join(f"· {line[:40]}" for line in bad[:3])
+            more = f"\n…共 {len(bad)} 行" if len(bad) > 3 else ""
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"有 {len(bad)} 行不是 [时间:毫秒] 或 [元数据] 格式：\n{sample}{more}\n\n仍要保存吗？",
+                    parent=self):
+                return
         target = self.save_path
         if target.exists() and not messagebox.askyesno(
                 APP_TITLE, f"{target.name} 已存在，覆盖？", parent=self):
             return
         try:
-            payload = self.content.encode(self.encoding)
+            payload = text.encode(self.encoding)
         except (UnicodeEncodeError, LookupError):
             if not messagebox.askyesno(
                     APP_TITLE,
                     f"当前内容无法用 {self.encoding.upper()} 保存（含该编码没有的字符）。\n改用 UTF-8 保存？",
                     parent=self):
                 return
-            payload = self.content.encode("utf-8")
+            payload = text.encode("utf-8")
         try:
             target.write_bytes(payload)
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"保存失败：{exc}", parent=self)
             return
-        self.save_button.configure(state="disabled", text="已保存")
+        self.content = text
+        self.title(f"{self.base_title} · 已保存")
         if self.on_saved is not None:
             self.on_saved(target)
 
