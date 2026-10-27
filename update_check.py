@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
+from urllib.parse import unquote
 
 from version import __version__
 
@@ -52,6 +54,35 @@ def is_newer(latest: str, current: str = __version__) -> bool:
     return new + (0,) * (width - len(new)) > cur + (0,) * (width - len(cur))
 
 
+def _latest_from_redirect(timeout: float) -> dict:
+    """API 被限流时的兜底。
+
+    ``/releases/latest`` 会 302 到 ``/releases/tag/<tag>``，从最终 URL 里取版本号；
+    拿不到 Release 正文，但足以判断要不要提示更新，也不受匿名 API 配额限制。
+    """
+    request = urllib.request.Request(
+        RELEASES_PAGE,
+        headers={"User-Agent": f"Pebby-Lyrics/{__version__}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            final_url = response.geturl()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"网络不可用（{exc}）") from exc
+
+    match = re.search(r"/releases/tag/([^/?#]+)", final_url)
+    if not match:
+        raise RuntimeError("发布页没有跳转到具体版本")
+    tag = unquote(match.group(1))
+    return {
+        "tag": tag,
+        "version": tag.lstrip("vV"),
+        "url": final_url,
+        "notes": "",
+        "published_at": "",
+    }
+
+
 def fetch_latest(timeout: float = TIMEOUT) -> dict:
     """请求最新 Release，成功返回 ``{tag, version, url, notes, published_at}``。
 
@@ -71,7 +102,8 @@ def fetch_latest(timeout: float = TIMEOUT) -> dict:
         if exc.code == 404:
             raise RuntimeError("还没有发布任何版本") from exc
         if exc.code in (403, 429):
-            raise RuntimeError("GitHub 接口限流，请稍后再试") from exc
+            # 匿名 API 每小时 60 次，共享出口 IP 很容易被限；改读发布页跳转
+            return _latest_from_redirect(timeout)
         raise RuntimeError(f"GitHub 返回 HTTP {exc.code}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise RuntimeError(f"网络不可用（{exc}）") from exc

@@ -34,6 +34,9 @@ jobs:
       - name: Compile all modules
         run: python -m py_compile prepare_lrc.py lrc_gui.py version.py update_check.py
 
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Version comparison rules
         run: >
           python -c "import update_check as u;

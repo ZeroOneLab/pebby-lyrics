@@ -98,6 +98,7 @@ cd pebby-lyrics
 
 - 只在 GUI 启动约 2.5 秒后，在后台线程请求一次 `api.github.com/repos/ZeroOneLab/pebby-lyrics/releases/latest`
 - 每个自然日最多一次；设置里可关闭；“跳过此版本”会记住被跳过的版本，不再自动打扰
+- 匿名 API 有 60 次/小时/IP 的配额，共享出口很容易被限流；此时改读 `releases/latest` 的跳转地址取版本号，不依赖 API 配额
 - 请求只带 `User-Agent: Pebby-Lyrics/<版本>`，没有设备 ID、没有统计、没有遥测
 - **不会**自动下载或替换程序，只打开浏览器到发布页
 - 命令行默认不联网，只有显式 `--check-update` 才请求
@@ -135,6 +136,9 @@ requirements-lyrics.txt   Mutagen / OpenCC 版本约束
 # 打包（需要先跑过一次 prepare_lrc.cmd 以建立 .lrc-env）
 .\build_lrc_exe.cmd
 # 产物：build\output\Pebby-Lyrics.exe
+
+# 单元测试（不联网）
+python -m unittest discover -s tests -v
 ```
 
 打包用 PyInstaller 6.16.0，`--collect-data opencc` 负责把 OpenCC 的配置和词典塞进单文件；漏掉这一步，简繁转换会在别的机器上运行时崩溃。
