@@ -259,6 +259,147 @@ def open_with_notepad(path: Path) -> bool:
         return False
 
 
+class TextViewer(tk.Toplevel):
+    """应用内文本查看器。
+
+    杀软/沙箱环境里启动记事本可能被拦，用户点了链接却什么都没看到；
+    这里先把内容直接显示出来，能不能调外部程序只是附加能力。
+    """
+
+    def __init__(self, master, title: str, content: str, path: Path | None = None):
+        super().__init__(master)
+        self.title(title)
+        self.configure(bg=BG)
+        self.geometry("780x560")
+        self.minsize(520, 360)
+        self.path = path
+
+        wrap = ttk.Frame(self, padding=10)
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(1, weight=1)
+
+        ttk.Label(wrap, text=str(path) if path else "",
+                  foreground=MUTED).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        text = tk.Text(wrap, wrap="none", bg="#151515", fg=WHITE, insertbackground=WHITE,
+                       relief="flat", font=("Consolas", 10), padx=8, pady=6)
+        text.grid(row=1, column=0, sticky="nsew")
+        text.insert("1.0", content)
+        text.configure(state="disabled")
+        yscroll = ttk.Scrollbar(wrap, orient="vertical", command=text.yview)
+        yscroll.grid(row=1, column=1, sticky="ns")
+        xscroll = ttk.Scrollbar(wrap, orient="horizontal", command=text.xview)
+        xscroll.grid(row=2, column=0, sticky="ew")
+        text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        bar = ttk.Frame(wrap)
+        bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(bar, text="关闭", command=self.destroy).pack(side="right")
+        if path is not None:
+            ttk.Button(bar, text="用记事本打开",
+                       command=self._open_external).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="复制全文",
+                   command=lambda: self._copy(content)).pack(side="right", padx=(0, 6))
+
+    def _copy(self, content: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(content)
+
+    def _open_external(self) -> None:
+        if self.path is not None and not open_with_notepad(self.path):
+            messagebox.showerror(APP_TITLE, f"系统不允许启动记事本，可以直接看这个窗口里的内容。\n{self.path}")
+
+
+class FolderBrowser(tk.Toplevel):
+    """应用内目录浏览：外部资源管理器打不开时的兜底。"""
+
+    def __init__(self, master, folder: Path):
+        super().__init__(master)
+        self.title(f"目录内容 - {folder.name or folder}")
+        self.configure(bg=BG)
+        self.geometry("760x500")
+        self.minsize(520, 360)
+        self.folder = folder
+
+        wrap = ttk.Frame(self, padding=10)
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(2, weight=1)
+
+        bar = ttk.Frame(wrap)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.columnconfigure(1, weight=1)
+        ttk.Button(bar, text="上一级", command=self._go_up).grid(row=0, column=0, padx=(0, 6))
+        self.path_var = tk.StringVar()
+        ttk.Label(bar, textvariable=self.path_var, foreground=FG).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(wrap, text="系统不允许自动打开资源管理器，这里是应用内浏览（路径已复制到剪贴板）",
+                  foreground=MUTED).grid(row=1, column=0, sticky="w", pady=(6, 4))
+
+        body = ttk.Frame(wrap)
+        body.grid(row=2, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(body, columns=("size",), show="tree headings", selectmode="browse")
+        self.tree.heading("#0", text="名称", anchor="w")
+        self.tree.heading("size", text="大小", anchor="e")
+        self.tree.column("#0", width=480, minwidth=260, anchor="w")
+        self.tree.column("size", width=100, minwidth=90, anchor="e", stretch=False)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.tag_configure("dir", foreground=GREEN)
+        self.tree.tag_configure("file", foreground=MUTED)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<Double-1>", self._enter)
+
+        footer = ttk.Frame(wrap)
+        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(footer, text="关闭", command=self.destroy).pack(side="right")
+        ttk.Button(footer, text="复制路径",
+                   command=self._copy_path).pack(side="right", padx=(0, 6))
+        self._load(folder)
+
+    def _copy_path(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(str(self.folder))
+
+    def _go_up(self) -> None:
+        if self.folder.parent != self.folder:
+            self._load(self.folder.parent)
+
+    def _enter(self, _event=None) -> None:
+        item = self.tree.focus()
+        if item and item != "..":
+            target = Path(item)
+            if target.is_dir():
+                self._load(target)
+
+    def _load(self, folder: Path) -> None:
+        try:
+            entries = list(folder.iterdir())
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"无法读取目录：{exc}", parent=self)
+            return
+        self.folder = folder
+        self.path_var.set(str(folder))
+        self.title(f"目录内容 - {folder.name or folder}")
+        self.tree.delete(*self.tree.get_children())
+        dirs = sorted((item for item in entries if item.is_dir()), key=lambda item: item.name.casefold())
+        files = sorted((item for item in entries if item.is_file()), key=lambda item: item.name.casefold())
+        if folder.parent != folder:
+            self.tree.insert("", "end", iid="..", text="..（上一级）", values=("",), tags=("dir",))
+        for item in dirs:
+            self.tree.insert("", "end", iid=str(item), text=item.name, values=("",), tags=("dir",))
+        for item in files:
+            try:
+                size = f"{item.stat().st_size / 1024:.0f} KB"
+            except OSError:
+                size = ""
+            self.tree.insert("", "end", iid=str(item), text=item.name, values=(size,), tags=("file",))
+
+
 class LrcApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -630,21 +771,24 @@ class LrcApp:
         self.log_text.configure(state="disabled")
 
     def _open_preview_file(self, path) -> None:
-        if not open_with_notepad(Path(path)):
-            messagebox.showerror(APP_TITLE, f"无法用记事本打开：{path}")
+        target = Path(path)
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"无法读取预览文件：{exc}")
+            return
+        TextViewer(self.root, f"预览 - {target.name}", content, target)
 
     def _open_preview_dir(self, path) -> None:
-        if not open_in_explorer(Path(path)):
-            self._copy_path_toast(Path(path), "无法打开目录")
+        self._reveal_folder(Path(path))
 
-    def _copy_path_toast(self, path: Path, why: str) -> None:
-        """打不开时至少把路径复制到剪贴板，并说清楚怎么用。"""
+    def _reveal_folder(self, folder: Path) -> None:
+        """优先交给资源管理器；shell 被系统拦住时退回应用内浏览。"""
+        if open_in_explorer(folder):
+            return
         self.root.clipboard_clear()
-        self.root.clipboard_append(str(path))
-        messagebox.showwarning(
-            APP_TITLE,
-            f"{why}，路径已复制到剪贴板：\n{path}\n\n"
-            "可以粘贴到资源管理器的地址栏里打开。")
+        self.root.clipboard_append(str(folder))
+        FolderBrowser(self.root, folder)
 
     def _cleanup_previews(self) -> None:
         """删掉本次运行生成的预览目录，顺手收掉空的父目录。"""
@@ -686,9 +830,7 @@ class LrcApp:
         if not folder.is_dir():
             messagebox.showerror(APP_TITLE, "请先选择有效的音乐目录。")
             return
-        if not open_in_explorer(folder):
-            # 打不开至少让路径可复制：受限或提权环境里 shell 关联可能整个不可用
-            self._copy_path_toast(folder, "无法打开目录")
+        self._reveal_folder(folder)
 
     def _set_running(self, running: bool, mode: str = "generate") -> None:
         self.running = running
