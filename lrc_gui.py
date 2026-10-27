@@ -381,7 +381,8 @@ class LrcApp:
         self.settings_path = settings_dir() / "settings.json"
 
         self.folder_var = tk.StringVar()
-        self.recursive_var = tk.BooleanVar(value=False)
+        self.scope_var = tk.StringVar(value="dir")
+        self.picked_file: Path | None = None
         self.prefer_var = tk.StringVar(value="simplified")
         self.overwrite_var = tk.BooleanVar(value=False)
         self.credits_var = tk.BooleanVar(value=False)
@@ -463,7 +464,7 @@ class LrcApp:
         ttk.Label(folder_row, text="音乐目录").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.folder_entry = ttk.Entry(folder_row, textvariable=self.folder_var)
         self.folder_entry.grid(row=0, column=1, sticky="ew")
-        self.browse_button = ttk.Button(folder_row, text="选择文件夹", command=self._choose_folder)
+        self.browse_button = ttk.Button(folder_row, text="选择文件", command=self._choose_folder)
         self.browse_button.grid(row=0, column=2, padx=(8, 0))
 
         options = ttk.LabelFrame(main, text="选项", padding=10)
@@ -487,14 +488,17 @@ class LrcApp:
         CheckItem(prefer_row, text="强制转换", variable=self.convert_var).pack(
             side="left", padx=(18, 0))
 
-        flags_row = ttk.Frame(options)
-        flags_row.grid(row=2, column=0, sticky="w", pady=(8, 0))
-        for text, variable in (("递归子文件夹", self.recursive_var),
-                               ("覆盖已有 LRC", self.overwrite_var),
+        scope_row = ttk.Frame(options)
+        scope_row.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(scope_row, text="处理范围").pack(side="left", padx=(0, 6))
+        for text, value in (("当前文件", "file"), ("当前目录", "dir"), ("包含子目录", "recursive")):
+            ttk.Radiobutton(scope_row, text=text, value=value,
+                            variable=self.scope_var).pack(side="left", padx=(0, 2))
+        for text, variable in (("覆盖已有 LRC", self.overwrite_var),
                                ("移除片头信息", self.credits_var),
                                ("仅预览不写文件", self.preview_var),
                                ("启动时检查更新", self.check_updates_var)):
-            CheckItem(flags_row, text=text, variable=variable).pack(side="left", padx=(0, 18))
+            CheckItem(scope_row, text=text, variable=variable).pack(side="left", padx=(12, 0))
 
         limits = ttk.Frame(options)
         limits.grid(row=3, column=0, sticky="w", pady=(8, 0))
@@ -576,7 +580,12 @@ class LrcApp:
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if isinstance(data.get("folder"), str):
                 self.folder_var.set(data["folder"])
-            self.recursive_var.set(bool(data.get("recursive", False)))
+            # 旧的 settings 只有 recursive 布尔值，迁移成三种处理范围
+            scope = data.get("scope")
+            if scope in {"dir", "recursive"}:
+                self.scope_var.set(scope)
+            elif data.get("recursive"):
+                self.scope_var.set("recursive")
             if data.get("prefer") in {"simplified", "traditional"}:
                 self.prefer_var.set(data["prefer"])
             self.overwrite_var.set(bool(data.get("overwrite", False)))
@@ -609,7 +618,8 @@ class LrcApp:
     def _save_settings(self) -> None:
         data = {
             "folder": self.folder_var.get().strip(),
-            "recursive": self.recursive_var.get(),
+            # “当前文件”依赖本次选中的文件，不写进配置，下次按当前目录处理
+            "scope": "dir" if self.scope_var.get() == "file" else self.scope_var.get(),
             "prefer": self.prefer_var.get(),
             "overwrite": self.overwrite_var.get(),
             "credits": self.credits_var.get(),
@@ -773,14 +783,24 @@ class LrcApp:
         patterns = " ".join(f"*{suffix}" for suffix in sorted(core.AUDIO_SUFFIXES))
         chosen = filedialog.askopenfilename(
             parent=self.root,
-            title="选择音乐目录：选中音频文件即用其所在目录，也可在文件名框直接输入路径",
+            title="选择音频文件（处理它所在的目录；也可在文件名框直接输入目录路径）",
             initialdir=initial,
             filetypes=[("音频文件", patterns), ("所有文件", "*.*")])
         if not chosen:
             return
         picked = Path(chosen)
-        # 选到文件就用它所在的目录；选到目录（手输路径时可能）就直接用
-        self.folder_var.set(str(picked if picked.is_dir() else picked.parent))
+        if picked.is_dir():
+            # 手输路径时可能拿到目录，按目录处理
+            self.picked_file = None
+            self.folder_var.set(str(picked))
+            if self.scope_var.get() == "file":
+                self.scope_var.set("dir")
+        else:
+            # 选中音频文件：记住它，并默认只处理这一个
+            self.picked_file = picked
+            self.folder_var.set(str(picked.parent))
+            self.scope_var.set("file")
+            self._log("info", f"已选中文件：{picked.name}（处理范围：当前文件）")
 
     def _set_running(self, running: bool, mode: str = "generate") -> None:
         self.running = running
@@ -798,13 +818,34 @@ class LrcApp:
         if self.running:
             return
         folder = Path(self.folder_var.get().strip())
+        if folder.is_file():
+            # 直接把音频文件路径输进输入框也认，按“它所在目录 + 当前文件”处理
+            self.picked_file = folder
+            folder = folder.parent
+            self.folder_var.set(str(folder))
+            self.scope_var.set("file")
         if not folder.is_dir():
-            messagebox.showerror(APP_TITLE, "请选择有效的音乐目录。")
+            messagebox.showerror(APP_TITLE, "请选择有效的音乐目录或音频文件。")
             return
         formats = {suffix for suffix, var in self.format_vars.items() if var.get()}
         if not formats:
             messagebox.showerror(APP_TITLE, "至少选择一种音频格式。")
             return
+        scope = self.scope_var.get()
+        single_file = None
+        if scope == "file":
+            candidate = self.picked_file
+            if (candidate is None or not candidate.is_file()
+                    or candidate.parent != folder):
+                messagebox.showerror(
+                    APP_TITLE,
+                    "“当前文件”需要先用“选择文件”选中一个音频文件。\n"
+                    "也可以改选“当前目录”或“包含子目录”。")
+                return
+            single_file = candidate
+            if single_file.suffix.casefold() not in formats:
+                messagebox.showerror(APP_TITLE, "当前文件的格式没有在“识别格式”里勾选。")
+                return
         try:
             duration = float(self.duration_var.get())
             end_tolerance = float(self.end_tolerance_var.get())
@@ -859,7 +900,7 @@ class LrcApp:
         if name_format != core.DEFAULT_NAME_FORMAT:
             self._log("warn", "当前文件名格式不是“与音频同名”，按文件名找歌词的播放器可能识别不到。")
         args = (
-            folder, formats, self.recursive_var.get(), self.prefer_var.get(),
+            folder, formats, scope, single_file, self.prefer_var.get(),
             self.overwrite_var.get(), self.credits_var.get(), self.convert_var.get(),
             self.preview_var.get(), duration, end_tolerance, max_line,
             self.source_var.get(), self.encoding_var.get(), name_format,
@@ -868,7 +909,8 @@ class LrcApp:
         self.worker = threading.Thread(target=self._generate_worker, args=args, daemon=True)
         self.worker.start()
 
-    def _generate_worker(self, folder: Path, formats: set[str], recursive: bool,
+    def _generate_worker(self, folder: Path, formats: set[str], scope: str,
+                         single_file: Path | None,
                          prefer: str, overwrite: bool, credits: bool, convert: bool,
                          preview: bool, duration: float, end_tolerance: float,
                          max_line: int, source: str, encoding: str,
@@ -878,7 +920,11 @@ class LrcApp:
         errors: list[str] = []
         results: list[dict] = []
         try:
-            files = core.scan_audio(folder, errors, recursive=recursive, suffixes=formats)
+            if scope == "file" and single_file is not None:
+                files = [Path(single_file)]
+            else:
+                files = core.scan_audio(folder, errors, recursive=scope == "recursive",
+                                        suffixes=formats)
             self.queue.put(("scan", len(files), list(errors)))
             for index, path in enumerate(files, 1):
                 if self.cancel_event.is_set():
@@ -914,11 +960,13 @@ class LrcApp:
         if self.running:
             return
         folder = Path(self.folder_var.get().strip())
+        if folder.is_file():
+            folder = folder.parent
         if not folder.is_dir():
             messagebox.showerror(APP_TITLE, "请选择有效的音乐目录。")
             return
         try:
-            files = find_lrc_files(folder, self.recursive_var.get())
+            files = find_lrc_files(folder, self.scope_var.get() == "recursive")
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"扫描歌词失败：{exc}")
             return
