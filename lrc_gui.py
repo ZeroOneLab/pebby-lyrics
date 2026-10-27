@@ -201,6 +201,13 @@ class LrcApp:
         style.map("TButton", background=[("active", "#45454a")],
                   foreground=[("disabled", MUTED)])
         style.configure("TEntry", fieldbackground=FIELD, foreground=FG, insertcolor=FG)
+        # clam 默认把 Spinbox 箭头画成黑色，在深色底上完全看不见
+        style.configure("TSpinbox", fieldbackground=FIELD, foreground=FG, insertcolor=FG,
+                        arrowcolor=FG, arrowsize=14, background="#45454a",
+                        bordercolor=FIELD, lightcolor="#45454a", darkcolor="#45454a")
+        style.map("TSpinbox", fieldbackground=[("disabled", FIELD)],
+                  foreground=[("disabled", MUTED)],
+                  arrowcolor=[("disabled", MUTED)])
         style.configure("TCombobox", fieldbackground=FIELD, background=FIELD,
                         foreground=FG, arrowcolor=FG)
         style.map("TCombobox", fieldbackground=[("readonly", FIELD)])
