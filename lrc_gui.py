@@ -334,35 +334,36 @@ class LrcApp:
 
         options = ttk.LabelFrame(main, text="选项", padding=10)
         options.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        options.columnconfigure(1, weight=1)
-        options.columnconfigure(3, weight=1)
+        options.columnconfigure(0, weight=1)
 
-        CheckItem(options, text="递归子文件夹", variable=self.recursive_var).grid(
-            row=0, column=0, sticky="w", padx=(0, 18))
-        prefer = ttk.Frame(options)
-        prefer.grid(row=0, column=1, sticky="w")
-        ttk.Label(prefer, text="优先文字").pack(side="left", padx=(0, 6))
-        ttk.Radiobutton(prefer, text="简体", value="simplified", variable=self.prefer_var).pack(side="left")
-        ttk.Radiobutton(prefer, text="繁体", value="traditional", variable=self.prefer_var).pack(
-            side="left", padx=(8, 0))
-        CheckItem(prefer, text="强制转换", variable=self.convert_var).pack(side="left", padx=(18, 0))
+        formats_row = ttk.Frame(options)
+        formats_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(formats_row, text="识别格式").pack(side="left", padx=(0, 10))
+        for suffix, label in FORMAT_OPTIONS:
+            CheckItem(formats_row, text=label, variable=self.format_vars[suffix]).pack(
+                side="left", padx=(0, 8))
 
-        ttk.Label(options, text="识别格式").grid(row=0, column=2, sticky="e", padx=(18, 6))
-        formats = ttk.Frame(options)
-        formats.grid(row=0, column=3, sticky="w")
-        for index, (suffix, label) in enumerate(FORMAT_OPTIONS):
-            CheckItem(formats, text=label, variable=self.format_vars[suffix]).grid(
-                row=0, column=index, padx=(0, 4))
+        prefer_row = ttk.Frame(options)
+        prefer_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(prefer_row, text="优先文字").pack(side="left", padx=(0, 6))
+        ttk.Radiobutton(prefer_row, text="简体", value="simplified",
+                        variable=self.prefer_var).pack(side="left")
+        ttk.Radiobutton(prefer_row, text="繁体", value="traditional",
+                        variable=self.prefer_var).pack(side="left", padx=(8, 0))
+        CheckItem(prefer_row, text="强制转换", variable=self.convert_var).pack(
+            side="left", padx=(18, 0))
 
-        CheckItem(options, text="覆盖已有 LRC", variable=self.overwrite_var).grid(
-            row=1, column=0, sticky="w", pady=(8, 0))
-        CheckItem(options, text="移除片头信息", variable=self.credits_var).grid(
-            row=1, column=1, sticky="w", pady=(8, 0))
-        CheckItem(options, text="仅预览不写文件", variable=self.preview_var).grid(
-            row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
+        flags_row = ttk.Frame(options)
+        flags_row.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        for text, variable in (("递归子文件夹", self.recursive_var),
+                               ("覆盖已有 LRC", self.overwrite_var),
+                               ("移除片头信息", self.credits_var),
+                               ("仅预览不写文件", self.preview_var),
+                               ("启动时检查更新", self.check_updates_var)):
+            CheckItem(flags_row, text=text, variable=variable).pack(side="left", padx=(0, 18))
 
         limits = ttk.Frame(options)
-        limits.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        limits.grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Label(limits, text="最大时长差(秒)").pack(side="left")
         ttk.Spinbox(limits, from_=0.0, to=60.0, increment=0.5, width=6,
                     textvariable=self.duration_var).pack(side="left", padx=(4, 16))
@@ -373,22 +374,17 @@ class LrcApp:
         ttk.Spinbox(limits, from_=0, to=80, increment=1, width=5,
                     textvariable=self.max_line_var).pack(side="left", padx=(4, 16))
 
-        advanced = ttk.Frame(options)
-        advanced.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ttk.Label(advanced, text="来源").pack(side="left")
-        ttk.Combobox(advanced, width=8, state="readonly", textvariable=self.source_var,
+        extra = ttk.Frame(options)
+        extra.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(extra, text="来源").pack(side="left")
+        ttk.Combobox(extra, width=8, state="readonly", textvariable=self.source_var,
                      values=("auto", "qq", "lrclib")).pack(side="left", padx=(4, 16))
-        ttk.Label(advanced, text="编码").pack(side="left")
-        ttk.Combobox(advanced, width=8, state="readonly", textvariable=self.encoding_var,
+        ttk.Label(extra, text="编码").pack(side="left")
+        ttk.Combobox(extra, width=8, state="readonly", textvariable=self.encoding_var,
                      values=("utf-8", "gbk")).pack(side="left", padx=(4, 16))
-        CheckItem(advanced, text="启动时检查更新", variable=self.check_updates_var).pack(
-            side="left")
-
-        naming = ttk.Frame(options)
-        naming.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ttk.Label(naming, text="文件名格式").pack(side="left")
-        ttk.Combobox(naming, width=14, state="readonly", textvariable=self.name_format_var,
-                     values=tuple(core.NAME_FORMATS.values())).pack(side="left", padx=(4, 8))
+        ttk.Label(extra, text="文件名格式").pack(side="left")
+        ttk.Combobox(extra, width=14, state="readonly", textvariable=self.name_format_var,
+                     values=tuple(core.NAME_FORMATS.values())).pack(side="left", padx=(4, 0))
 
         actions = ttk.Frame(main)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -901,7 +897,7 @@ class LrcApp:
             self._log_result_detail(result)
             if result.get("preview_path"):
                 self._log_link(
-                    f"  预览文件：{Path(result['preview_path']).name}（点击用记事本打开）",
+                    f"  预览文件：{Path(result['preview_path']).name}（点击预览）",
                     result["preview_path"], self._open_preview_file)
             if result.get("preview_error"):
                 self._log("warn", f"  {result['preview_error']}")
@@ -943,9 +939,6 @@ class LrcApp:
         summary = prefix + "，".join(parts)
         self.summary_label.configure(text=f"完成：{summary}")
         self._log("summary", f"全部完成：{summary}")
-        if previewed and self.preview_dir is not None:
-            self._log_link(f"预览文件目录：{self.preview_dir}（点击复制路径）",
-                           self.preview_dir, self._copy_path)
         for error in errors:
             self._log("warn", f"扫描警告：{error}")
         self._save_settings()
