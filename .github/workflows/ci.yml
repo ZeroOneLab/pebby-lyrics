@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-lyrics.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-lyrics.txt
+
+      - name: Compile all modules
+        run: python -m py_compile prepare_lrc.py lrc_gui.py version.py update_check.py
+
+      - name: Version comparison rules
+        run: >
+          python -c "import update_check as u;
+          assert u.parse_version('v1.2.3') == (1, 2, 3);
+          assert u.parse_version('1.2.3-rc1') == (1, 2, 3);
+          assert u.is_newer('v1.2.0', '1.1.9');
+          assert not u.is_newer('v1.0.0', '1.0.0');
+          assert not u.is_newer('1.0.0', '1.0.1');
+          print('version rules ok')"
+
+      - name: CLI help renders
+        run: python prepare_lrc.py --help

@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-lyrics.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-lyrics.txt "pyinstaller==6.16.0"
+
+      - name: Check tag matches version.py
+        shell: pwsh
+        run: |
+          $version = python -c "from version import __version__; print(__version__)"
+          Write-Host "version.py = $version, tag = ${{ github.ref_name }}"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "tag ${{ github.ref_name }} 与 version.py ($version) 不一致，请先改版本号再打 tag。"
+          }
+
+      - name: Build single-file exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name Pebby-Lyrics --runtime-tmpdir .
+          --collect-data opencc
+          --distpath dist --workpath build --specpath build
+          lrc_gui.py
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Pebby-Lyrics.exe
+          generate_release_notes: true
