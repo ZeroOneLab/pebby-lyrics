@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import queue
 import shutil
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -142,6 +143,190 @@ class CheckItem(tk.Frame):
                                  fg=GREEN if checked else MUTED)
 
 
+class FolderPickerDialog(tk.Toplevel):
+    """选目录时顺便列出里面的音频文件。
+
+    系统自带的 askdirectory 只显示文件夹，用户看不出这个目录里到底有没有歌；
+    这里把子目录和音频文件一起列出，并显示本目录/含子目录的音频数量。
+    """
+
+    def __init__(self, master, initial: Path):
+        super().__init__(master)
+        self.title("选择音乐目录")
+        self.configure(bg=BG)
+        self.transient(master)
+        self.minsize(660, 440)
+        self.geometry("760x480")
+        self.result: Path | None = None
+        self.path = initial if initial.is_dir() else Path.home()
+        self.current_files = 0
+        self._count_token = 0
+        self._count_queue: queue.Queue = queue.Queue()
+        self._build_widgets()
+        self._navigate(self.path)
+        self.grab_set()
+        self.bind("<Escape>", lambda _event: self._cancel())
+        self.after(120, self._poll_count)
+
+    # ------------------------------------------------------------
+    def _build_widgets(self) -> None:
+        wrap = ttk.Frame(self, padding=10)
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(2, weight=1)
+
+        bar = ttk.Frame(wrap)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.columnconfigure(1, weight=1)
+        ttk.Button(bar, text="上一级", command=self._go_up).grid(row=0, column=0, padx=(0, 6))
+        self.path_var = tk.StringVar()
+        entry = ttk.Entry(bar, textvariable=self.path_var)
+        entry.grid(row=0, column=1, sticky="ew")
+        entry.bind("<Return>", self._on_entry_return)
+
+        ttk.Label(wrap, text="双击文件夹进入；双击音频文件即选中它所在的目录",
+                  foreground=MUTED).grid(row=1, column=0, sticky="w", pady=(6, 4))
+
+        body = ttk.Frame(wrap)
+        body.grid(row=2, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(body, columns=("size",), show="tree headings",
+                                 selectmode="browse", height=12)
+        self.tree.heading("#0", text="名称", anchor="w")
+        self.tree.heading("size", text="大小", anchor="e")
+        self.tree.column("#0", width=470, minwidth=280, anchor="w", stretch=True)
+        self.tree.column("size", width=100, minwidth=90, anchor="e", stretch=False)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.tag_configure("dir", foreground=GREEN)
+        self.tree.tag_configure("file", foreground=MUTED)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<Double-1>", self._on_activate)
+        self.tree.bind("<Return>", self._on_activate)
+
+        self.status = ttk.Label(wrap, text="", foreground=MUTED)
+        self.status.grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        btns = ttk.Frame(wrap)
+        btns.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(btns, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(btns, text="选择此文件夹", command=self._accept).pack(side="right", padx=(0, 6))
+
+    # ------------------------------------------------------------
+    def _navigate(self, path: Path) -> None:
+        try:
+            entries = list(path.iterdir())
+        except OSError as exc:
+            messagebox.showerror("选择音乐目录", f"无法读取目录：{exc}", parent=self)
+            return
+        self.path = path
+        self.path_var.set(str(path))
+        self.tree.delete(*self.tree.get_children())
+        if path.parent != path:
+            self.tree.insert("", "end", iid="..", text="..（上一级）", values=("",), tags=("dir",))
+        dirs = sorted((item for item in entries if item.is_dir() and not item.is_symlink()),
+                      key=lambda item: item.name.casefold())
+        files = sorted((item for item in entries
+                        if item.is_file() and not item.is_symlink()
+                        and item.suffix.casefold() in core.AUDIO_SUFFIXES),
+                       key=lambda item: item.name.casefold())
+        for item in dirs:
+            self.tree.insert("", "end", iid=str(item), text=item.name, values=("",), tags=("dir",))
+        for item in files:
+            try:
+                megabytes = item.stat().st_size / 1048576
+            except OSError:
+                megabytes = 0.0
+            self.tree.insert("", "end", iid=str(item), text=item.name,
+                             values=(f"{megabytes:.1f} MB",), tags=("file",))
+        self.current_files = len(files)
+        self.status.configure(text=f"本目录 {len(files)} 个音频 · 含子目录统计中…")
+        self._start_recursive_count(path)
+
+    def _start_recursive_count(self, root: Path) -> None:
+        self._count_token += 1
+        token = self._count_token
+        suffixes = core.AUDIO_SUFFIXES
+
+        def work() -> None:
+            total = 0
+            truncated = False
+            for _dirpath, _dirnames, filenames in os.walk(root):
+                total += sum(1 for name in filenames if Path(name).suffix.casefold() in suffixes)
+                if total > 20000 or token != self._count_token:
+                    truncated = total > 20000
+                    break
+            self._count_queue.put((token, total, truncated))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_count(self) -> None:
+        try:
+            while True:
+                token, total, truncated = self._count_queue.get_nowait()
+                if token == self._count_token and self.winfo_exists():
+                    suffix = "+" if truncated else ""
+                    self.status.configure(
+                        text=f"本目录 {self.current_files} 个音频 · 含子目录 {total}{suffix} 个")
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(150, self._poll_count)
+
+    # ------------------------------------------------------------
+    def _go_up(self) -> None:
+        if self.path.parent != self.path:
+            self._navigate(self.path.parent)
+
+    def _on_entry_return(self, _event=None) -> None:
+        candidate = Path(self.path_var.get().strip())
+        if candidate.is_dir():
+            self._navigate(candidate)
+        else:
+            messagebox.showerror("选择音乐目录", "路径不存在或不是文件夹。", parent=self)
+
+    def _on_activate(self, _event=None) -> None:
+        item = self.tree.focus()
+        if not item:
+            return
+        if item == "..":
+            self._go_up()
+            return
+        target = Path(item)
+        if target.is_dir():
+            self._navigate(target)
+        else:
+            self._accept()
+
+    def _accept(self) -> None:
+        self.result = self.path
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
+def open_in_explorer(path: Path) -> bool:
+    """打开资源管理器窗口。
+
+    os.startfile 走 shell 关联，个别机器上对目录会抛 WinError 5；
+    失败时退回 explorer.exe —— 它一定能打开，只是退出码不可信，所以不看返回码。
+    """
+    try:
+        os.startfile(str(path))
+        return True
+    except OSError:
+        pass
+    try:
+        subprocess.Popen(["explorer", str(path)])
+        return True
+    except OSError:
+        return False
+
+
 class LrcApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -211,6 +396,12 @@ class LrcApp:
         style.configure("TCombobox", fieldbackground=FIELD, background=FIELD,
                         foreground=FG, arrowcolor=FG)
         style.map("TCombobox", fieldbackground=[("readonly", FIELD)])
+        style.configure("Treeview", background=FIELD, fieldbackground=FIELD,
+                        foreground=FG, bordercolor=FIELD, rowheight=22)
+        style.map("Treeview", background=[("selected", "#094771")],
+                  foreground=[("selected", WHITE)])
+        style.configure("Treeview.Heading", background="#2d2d30", foreground=FG,
+                        relief="flat", padding=(6, 4))
         style.configure("Horizontal.TProgressbar", background=GREEN, troughcolor=FIELD,
                         bordercolor=FIELD, lightcolor=GREEN, darkcolor=GREEN)
 
@@ -493,20 +684,19 @@ class LrcApp:
     # 文件夹/按钮
     # ------------------------------------------------------------
     def _choose_folder(self) -> None:
-        initial = self.folder_var.get().strip() or str(Path.home() / "Desktop")
-        folder = filedialog.askdirectory(initialdir=initial, title="选择音乐根目录")
-        if folder:
-            self.folder_var.set(folder)
+        initial = Path(self.folder_var.get().strip() or str(Path.home() / "Desktop"))
+        dialog = FolderPickerDialog(self.root, initial)
+        self.root.wait_window(dialog)
+        if dialog.result:
+            self.folder_var.set(str(dialog.result))
 
     def _open_folder(self) -> None:
         folder = Path(self.folder_var.get().strip())
         if not folder.is_dir():
             messagebox.showerror(APP_TITLE, "请先选择有效的音乐目录。")
             return
-        try:
-            os.startfile(str(folder))
-        except OSError as exc:
-            messagebox.showerror(APP_TITLE, f"无法打开目录：{exc}")
+        if not open_in_explorer(folder):
+            messagebox.showerror(APP_TITLE, f"无法打开目录：{folder}\n可以复制这个路径，手动在资源管理器里打开。")
 
     def _set_running(self, running: bool, mode: str = "generate") -> None:
         self.running = running
@@ -555,6 +745,8 @@ class LrcApp:
         self._set_running(True, "generate")
         self.cancel_event.clear()
         self._log("info", f"开始扫描：{folder}")
+        if self.preview_var.get():
+            self._log("warn", "预览模式：只查询和校验，不会写入任何 .lrc 文件。")
         name_format = next((key for key, label in core.NAME_FORMATS.items()
                             if label == self.name_format_var.get()), core.DEFAULT_NAME_FORMAT)
         if name_format != core.DEFAULT_NAME_FORMAT:
@@ -760,15 +952,20 @@ class LrcApp:
 
     def _on_done(self, results: list[dict], errors: list[str], cancelled: bool) -> None:
         self.results = results
-        success = sum(1 for item in results if item.get("status") in {"saved", "dry_run"})
+        saved = sum(1 for item in results if item.get("status") == "saved")
+        previewed = sum(1 for item in results if item.get("status") == "dry_run")
         skipped = sum(1 for item in results if item.get("status") == "exists")
-        failed = len(results) - success - skipped
+        failed = len(results) - saved - previewed - skipped
         self.report_button.configure(state="normal" if results else "disabled")
         self._set_running(False)
         self.progress.configure(value=self.total)
         self.progress_label.configure(text=f"{len(results)} / {self.total}")
         prefix = "已取消，" if cancelled else ""
-        summary = f"{prefix}成功 {success}，跳过 {skipped}，失败 {failed}"
+        parts = [f"成功 {saved}"]
+        if previewed:
+            parts.append(f"预览 {previewed}（未写文件）")
+        parts.extend([f"跳过 {skipped}", f"失败 {failed}"])
+        summary = prefix + "，".join(parts)
         self.summary_label.configure(text=f"完成：{summary}")
         self._log("summary", f"全部完成：{summary}")
         for error in errors:
