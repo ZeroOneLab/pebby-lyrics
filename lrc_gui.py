@@ -21,7 +21,6 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import traceback
-import webbrowser
 
 import update_check
 from version import __version__
@@ -377,7 +376,6 @@ class LrcApp:
         self.scan_errors: list[str] = []
         self._closing = False
         self.checking_update = False
-        self.dismissed_version = ""
         self.last_check_date = ""
         self.current_root: Path | None = None
         self.settings_path = settings_dir() / "settings.json"
@@ -588,8 +586,6 @@ class LrcApp:
             self.check_updates_var.set(bool(data.get("check_updates", False)))
             if data.get("name_format") in core.NAME_FORMATS:
                 self.name_format_var.set(core.NAME_FORMATS[data["name_format"]])
-            if isinstance(data.get("dismissed_version"), str):
-                self.dismissed_version = data["dismissed_version"]
             if isinstance(data.get("last_check"), str):
                 self.last_check_date = data["last_check"]
             self.disclaimer_accepted = bool(data.get("disclaimer", False))
@@ -628,7 +624,6 @@ class LrcApp:
                                  if label == self.name_format_var.get()), core.DEFAULT_NAME_FORMAT),
             "formats": [suffix for suffix, var in self.format_vars.items() if var.get()],
             "check_updates": self.check_updates_var.get(),
-            "dismissed_version": self.dismissed_version,
             "last_check": self.last_check_date,
             "disclaimer": self.disclaimer_accepted,
         }
@@ -686,32 +681,16 @@ class LrcApp:
             if manual:
                 message = str(result.get("message", "未知错误"))
                 self._log("warn", f"检查更新失败：{message}")
-                messagebox.showwarning(APP_TITLE, f"检查更新失败：{message}")
             return
         if status == "latest":
             self._log("muted", f"已是最新版本 v{__version__}")
-            if manual:
-                messagebox.showinfo(APP_TITLE, f"当前 v{__version__} 已是最新版本。")
             return
         version = str(result.get("version") or "")
-        if version and not manual and version == self.dismissed_version:
-            return
-        self._log("success", f"发现新版本 v{version}（当前 v{__version__}）")
-        detail = ""
-        notes = str(result.get("notes") or "").strip()
-        if notes:
-            detail = "\n\n" + notes.splitlines()[0][:120]
-        answer = messagebox.askyesno(
-            f"{APP_TITLE} · 检查更新",
-            f"发现新版本 v{version}（当前 v{__version__}）。{detail}"
-            "\n\n是否前往发布页下载？",
-        )
-        if answer:
-            webbrowser.open(str(result.get("url") or update_check.RELEASES_PAGE))
-        elif version:
-            # 记下被跳过的版本，同一版本不再自动打扰
-            self.dismissed_version = version
-            self._save_settings()
+        url = str(result.get("url") or update_check.RELEASES_PAGE)
+        self._log("success", f"发现新版本 v{version}（当前 v{__version__}），"
+                             f"去发布页下载新 exe 即可")
+        # 只给链接，点了复制，自己去浏览器打开；不自动跳转
+        self._log_link(f"  发布页：{url}（点击复制链接）", url, self._copy_text)
 
     # ------------------------------------------------------------
     # 日志
@@ -757,12 +736,16 @@ class LrcApp:
     def _on_preview_saved(self, target: Path) -> None:
         self._log("info", f"已保存到歌曲目录：{target}（不计入成功统计）")
 
+    def _copy_text(self, text) -> None:
+        """通用“点击复制”：路径、链接都用它，只复制不打开。"""
+        value = str(text)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(value)
+        self._log("muted", f"已复制：{value}")
+
     def _copy_path(self, path) -> None:
         """目录链接不做“打开”，只把路径复制到剪贴板。"""
-        text = str(path)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self._log("muted", f"已复制路径：{text}")
+        self._copy_text(path)
 
     def _cleanup_previews(self) -> None:
         """删掉本次运行生成的预览目录，顺手收掉空的父目录。"""
