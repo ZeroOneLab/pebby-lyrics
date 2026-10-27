@@ -35,6 +35,7 @@ except ImportError:  # 允许只拷贝 lrc_gui.py 后从任意目录运行
 
 
 APP_TITLE = "Pebby Lyrics 歌词工具"
+PREVIEW_DIR_NAME = "_pebby_preview"
 FORMAT_OPTIONS = [
     (".mp3", "MP3"),
     (".wav", "WAV"),
@@ -146,37 +147,106 @@ class CheckItem(tk.Frame):
 def open_in_explorer(path: Path) -> bool:
     """打开资源管理器窗口。
 
-    依次尝试 os.startfile（走 shell 关联）和 Shell.Application COM 的 Explore。
-    不启动 explorer.exe：程序以管理员身份运行时，新起的 explorer 会因拒绝提权
-    而报 0xC0000142「应用程序无法正常启动」，用户只会看到一个莫名其妙的错误框。
+    只用两条不创建子进程的路：
+    1. ``os.startfile``：交给 shell 关联处理；
+    2. ``Shell.Application`` COM 的 ``Explore``：让已在运行的文件管理器打开目录。
+
+    不启动 explorer.exe / powershell.exe——在受限或提权环境里创建子进程会被拒绝
+    （0xC0000142、Access denied），用户只会看到系统错误框。
     """
     try:
         os.startfile(str(path))
         return True
     except OSError:
         pass
-    return explore_via_shell(path)
+    return explore_via_com(path)
 
 
-def explore_via_shell(path: Path) -> bool:
-    """让已经在跑的资源管理器打开目录，不创建新进程。
+def _com_guid(text):
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
 
-    通过 PowerShell 调 Shell.Application COM，路径经环境变量传递，
-    免得中文或引号在命令行里被二次转义。
-    """
-    script = ("$ErrorActionPreference = 'Stop'; "
-              "$shell = New-Object -ComObject Shell.Application; "
-              "$shell.Explore($env:PEBBY_OPEN_PATH)")
-    env = os.environ.copy()
-    env["PEBBY_OPEN_PATH"] = str(path)
-    try:
-        completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            env=env, timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.SubprocessError):
+    guid = GUID()
+    hr = ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(guid))
+    if hr != 0:
+        raise OSError(f"CLSIDFromString 失败: 0x{hr & 0xFFFFFFFF:08x}")
+    return guid
+
+
+def _explore_com(path: str) -> bool:
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    class VARIANT(ctypes.Structure):
+        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                    ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                    ("value", ctypes.c_void_p), ("pad", ctypes.c_void_p)]
+
+    class DISPPARAMS(ctypes.Structure):
+        _fields_ = [("rgvarg", ctypes.POINTER(VARIANT)),
+                    ("rgdispidNamedArgs", ctypes.POINTER(ctypes.c_long)),
+                    ("cArgs", ctypes.c_uint), ("cNamedArgs", ctypes.c_uint)]
+
+    ole32 = ctypes.OleDLL("ole32")
+    oleaut = ctypes.OleDLL("oleaut32")
+
+    # 已有 COM 初始化时返回 RPC_E_CHANGED_MODE，可以忽略
+    ole32.CoInitializeEx(None, 2)
+
+    clsid = _com_guid("{13709620-C279-11CE-A49E-444553540000}")   # Shell.Application
+    iid = _com_guid("{00020400-0000-0000-C000-000000000046}")     # IDispatch
+    pointer = ctypes.c_void_p()
+    hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, 4, ctypes.byref(iid),
+                                ctypes.byref(pointer))
+    if hr != 0 or not pointer.value:
         return False
-    return completed.returncode == 0
+
+    vtable = ctypes.cast(ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0],
+                         ctypes.POINTER(ctypes.c_void_p))
+    get_ids = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID),
+                                 ctypes.POINTER(ctypes.c_wchar_p), ctypes.c_uint,
+                                 ctypes.c_ulong, ctypes.POINTER(ctypes.c_long))(vtable[5])
+    invoke = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_long,
+                                ctypes.POINTER(GUID), ctypes.c_ulong, ctypes.c_ushort,
+                                ctypes.POINTER(DISPPARAMS), ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_void_p)(vtable[6])
+    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+
+    try:
+        nil = GUID()
+        name = ctypes.c_wchar_p("Explore")
+        dispid = ctypes.c_long()
+        hr = get_ids(pointer, ctypes.byref(nil), ctypes.byref(name), 1, 0,
+                     ctypes.byref(dispid))
+        if hr != 0:
+            return False
+        bstr = oleaut.SysAllocString(ctypes.c_wchar_p(path))
+        if not bstr:
+            return False
+        try:
+            argument = VARIANT(vt=8, r1=0, r2=0, r3=0, value=bstr, pad=None)  # VT_BSTR
+            params = DISPPARAMS(rgvarg=ctypes.pointer(argument), rgdispidNamedArgs=None,
+                                cArgs=1, cNamedArgs=0)
+            # DISPATCH_METHOD = 1
+            hr = invoke(pointer, dispid, ctypes.byref(nil), 0, 1, ctypes.byref(params),
+                        None, None, None)
+        finally:
+            oleaut.SysFreeString(bstr)
+        return hr == 0
+    finally:
+        release(pointer)
+
+
+def explore_via_com(path: Path) -> bool:
+    """用 Shell.Application COM 打开目录；任何异常都当作“没打开”。"""
+    if os.name != "nt":
+        return False
+    try:
+        return _explore_com(str(path))
+    except (OSError, AttributeError):
+        return False
 
 
 def open_with_notepad(path: Path) -> bool:
@@ -225,6 +295,7 @@ class LrcApp:
         self.check_updates_var = tk.BooleanVar(value=False)
         self._link_seq = 0
         self.preview_dir: Path | None = None
+        self._preview_dirs: list[Path] = []
 
         self._build_style()
         self._build_ui()
@@ -360,6 +431,7 @@ class LrcApp:
         self.report_button = ttk.Button(actions, text="保存报告", command=self._save_report,
                                         state="disabled")
         self.report_button.pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="清除日志", command=self._clear_log).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="检查更新", command=self._manual_check).pack(
             side="right", padx=(0, 8))
         ttk.Button(actions, text="打开目录", command=self._open_folder).pack(side="right")
@@ -563,20 +635,28 @@ class LrcApp:
 
     def _open_preview_dir(self, path) -> None:
         if not open_in_explorer(Path(path)):
-            messagebox.showerror(APP_TITLE, f"无法打开目录：{path}")
+            self._copy_path_toast(Path(path), "无法打开目录")
 
-    def _prune_previews(self, keep_days: int = 7) -> None:
-        """清掉 7 天前的预览目录，避免越攒越多。"""
-        base = app_data_dir() / "preview"
-        if not base.is_dir():
-            return
-        cutoff = datetime.now().timestamp() - keep_days * 86400
-        for item in base.iterdir():
+    def _copy_path_toast(self, path: Path, why: str) -> None:
+        """打不开时至少把路径复制到剪贴板，并说清楚怎么用。"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(str(path))
+        messagebox.showwarning(
+            APP_TITLE,
+            f"{why}，路径已复制到剪贴板：\n{path}\n\n"
+            "可以粘贴到资源管理器的地址栏里打开。")
+
+    def _cleanup_previews(self) -> None:
+        """删掉本次运行生成的预览目录，顺手收掉空的父目录。"""
+        for item in list(self._preview_dirs):
+            shutil.rmtree(item, ignore_errors=True)
+            parent = item.parent
             try:
-                if item.is_dir() and item.stat().st_mtime < cutoff:
-                    shutil.rmtree(item, ignore_errors=True)
+                if parent.name == PREVIEW_DIR_NAME and not any(parent.iterdir()):
+                    parent.rmdir()
             except OSError:
-                continue
+                pass
+        self._preview_dirs = []
 
     def _clear_log(self) -> None:
         self.log_text.configure(state="normal")
@@ -606,14 +686,9 @@ class LrcApp:
         if not folder.is_dir():
             messagebox.showerror(APP_TITLE, "请先选择有效的音乐目录。")
             return
-        if open_in_explorer(folder):
-            return
-        # 打不开至少让路径可复制：管理员运行时 shell 关联可能整个不可用
-        self.root.clipboard_clear()
-        self.root.clipboard_append(str(folder))
-        messagebox.showwarning(
-            APP_TITLE,
-            f"无法打开目录，路径已复制到剪贴板：\n{folder}\n\n可以粘贴到资源管理器地址栏。")
+        if not open_in_explorer(folder):
+            # 打不开至少让路径可复制：受限或提权环境里 shell 关联可能整个不可用
+            self._copy_path_toast(folder, "无法打开目录")
 
     def _set_running(self, running: bool, mode: str = "generate") -> None:
         self.running = running
@@ -662,18 +737,21 @@ class LrcApp:
         self._set_running(True, "generate")
         self.cancel_event.clear()
         self._log("info", f"开始扫描：{folder}")
+        self._cleanup_previews()
         self.preview_dir = None
         if self.preview_var.get():
-            self._log("warn", "预览模式：只查询和校验，不会写入音乐目录里的 .lrc。")
-            self.preview_dir = (app_data_dir() / "preview"
-                                / datetime.now().strftime("%Y%m%d-%H%M%S"))
-            self._prune_previews()
+            self._log("warn", "预览模式：只查询和校验，不写正式的 .lrc。")
+            candidate = (folder / PREVIEW_DIR_NAME
+                         / datetime.now().strftime("%Y%m%d-%H%M%S"))
             try:
-                self.preview_dir.mkdir(parents=True, exist_ok=True)
-                self._log_link(f"预览文件会写到 {self.preview_dir}（点击打开该目录）",
-                               self.preview_dir, self._open_preview_dir)
+                candidate.mkdir(parents=True, exist_ok=True)
+                self.preview_dir = candidate
+                self._preview_dirs.append(candidate)
+                self._log_link(f"预览文件会写到 {candidate}（点击打开该目录）",
+                               candidate, self._open_preview_dir)
             except OSError as exc:
-                self._log("warn", f"无法创建预览目录：{exc}")
+                reason = getattr(exc, "strerror", None) or str(exc)
+                self._log("warn", f"无法在音乐目录下创建预览目录 {candidate}：{reason}")
                 self.preview_dir = None
         name_format = next((key for key, label in core.NAME_FORMATS.items()
                             if label == self.name_format_var.get()), core.DEFAULT_NAME_FORMAT)
@@ -934,6 +1012,7 @@ class LrcApp:
             if not messagebox.askyesno(APP_TITLE, "任务仍在运行，确定退出？"):
                 return
             self.cancel_event.set()
+        self._cleanup_previews()
         self._save_settings()
         self._closing = True
         self.root.destroy()
