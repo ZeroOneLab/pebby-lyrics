@@ -56,11 +56,36 @@ CYAN = "#569cd6"
 WHITE = "#ffffff"
 
 
-def app_data_dir() -> Path:
-    base = os.environ.get("APPDATA")
-    if base:
-        return Path(base) / "Pebby-Lyrics"
-    return Path.home() / ".pebby-lyrics"
+_settings_dir_cache: Path | None = None
+
+
+def settings_dir() -> Path:
+    """配置文件目录：优先 exe（或源码）所在目录，不可写时退回 %APPDATA%。
+
+    放在 exe 旁边方便整包拷到 U 盘继续用；如果 exe 在 Program Files 这类
+    只读位置，会自动改用用户目录，不会因为写失败而丢配置。
+    """
+    global _settings_dir_cache
+    if _settings_dir_cache is not None:
+        return _settings_dir_cache
+    if getattr(sys, "frozen", False):
+        first = Path(sys.executable).resolve().parent
+    else:
+        first = Path(__file__).resolve().parent
+    appdata = os.environ.get("APPDATA")
+    second = Path(appdata) / "Pebby-Lyrics" if appdata else Path.home() / ".pebby-lyrics"
+    for candidate in (first, second):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".pebby-write-probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError:
+            continue
+        _settings_dir_cache = candidate
+        return candidate
+    _settings_dir_cache = second
+    return second
 
 
 def send_to_recycle_bin(paths: list[str]) -> bool:
@@ -144,111 +169,6 @@ class CheckItem(tk.Frame):
                                  fg=GREEN if checked else MUTED)
 
 
-def open_in_explorer(path: Path) -> bool:
-    """打开资源管理器窗口。
-
-    只用两条不创建子进程的路：
-    1. ``os.startfile``：交给 shell 关联处理；
-    2. ``Shell.Application`` COM 的 ``Explore``：让已在运行的文件管理器打开目录。
-
-    不启动 explorer.exe / powershell.exe——在受限或提权环境里创建子进程会被拒绝
-    （0xC0000142、Access denied），用户只会看到系统错误框。
-    """
-    try:
-        os.startfile(str(path))
-        return True
-    except OSError:
-        pass
-    return explore_via_com(path)
-
-
-def _com_guid(text):
-    class GUID(ctypes.Structure):
-        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
-                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
-
-    guid = GUID()
-    hr = ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(guid))
-    if hr != 0:
-        raise OSError(f"CLSIDFromString 失败: 0x{hr & 0xFFFFFFFF:08x}")
-    return guid
-
-
-def _explore_com(path: str) -> bool:
-    class GUID(ctypes.Structure):
-        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
-                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
-
-    class VARIANT(ctypes.Structure):
-        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
-                    ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
-                    ("value", ctypes.c_void_p), ("pad", ctypes.c_void_p)]
-
-    class DISPPARAMS(ctypes.Structure):
-        _fields_ = [("rgvarg", ctypes.POINTER(VARIANT)),
-                    ("rgdispidNamedArgs", ctypes.POINTER(ctypes.c_long)),
-                    ("cArgs", ctypes.c_uint), ("cNamedArgs", ctypes.c_uint)]
-
-    ole32 = ctypes.OleDLL("ole32")
-    oleaut = ctypes.OleDLL("oleaut32")
-
-    # 已有 COM 初始化时返回 RPC_E_CHANGED_MODE，可以忽略
-    ole32.CoInitializeEx(None, 2)
-
-    clsid = _com_guid("{13709620-C279-11CE-A49E-444553540000}")   # Shell.Application
-    iid = _com_guid("{00020400-0000-0000-C000-000000000046}")     # IDispatch
-    pointer = ctypes.c_void_p()
-    hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, 4, ctypes.byref(iid),
-                                ctypes.byref(pointer))
-    if hr != 0 or not pointer.value:
-        return False
-
-    vtable = ctypes.cast(ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0],
-                         ctypes.POINTER(ctypes.c_void_p))
-    get_ids = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID),
-                                 ctypes.POINTER(ctypes.c_wchar_p), ctypes.c_uint,
-                                 ctypes.c_ulong, ctypes.POINTER(ctypes.c_long))(vtable[5])
-    invoke = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_long,
-                                ctypes.POINTER(GUID), ctypes.c_ulong, ctypes.c_ushort,
-                                ctypes.POINTER(DISPPARAMS), ctypes.c_void_p,
-                                ctypes.c_void_p, ctypes.c_void_p)(vtable[6])
-    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
-
-    try:
-        nil = GUID()
-        name = ctypes.c_wchar_p("Explore")
-        dispid = ctypes.c_long()
-        hr = get_ids(pointer, ctypes.byref(nil), ctypes.byref(name), 1, 0,
-                     ctypes.byref(dispid))
-        if hr != 0:
-            return False
-        bstr = oleaut.SysAllocString(ctypes.c_wchar_p(path))
-        if not bstr:
-            return False
-        try:
-            argument = VARIANT(vt=8, r1=0, r2=0, r3=0, value=bstr, pad=None)  # VT_BSTR
-            params = DISPPARAMS(rgvarg=ctypes.pointer(argument), rgdispidNamedArgs=None,
-                                cArgs=1, cNamedArgs=0)
-            # DISPATCH_METHOD = 1
-            hr = invoke(pointer, dispid, ctypes.byref(nil), 0, 1, ctypes.byref(params),
-                        None, None, None)
-        finally:
-            oleaut.SysFreeString(bstr)
-        return hr == 0
-    finally:
-        release(pointer)
-
-
-def explore_via_com(path: Path) -> bool:
-    """用 Shell.Application COM 打开目录；任何异常都当作“没打开”。"""
-    if os.name != "nt":
-        return False
-    try:
-        return _explore_com(str(path))
-    except (OSError, AttributeError):
-        return False
-
-
 def open_with_notepad(path: Path) -> bool:
     """用记事本打开文件（预览结果是临时文件，双击关联不一定可用）。"""
     try:
@@ -311,95 +231,6 @@ class TextViewer(tk.Toplevel):
             messagebox.showerror(APP_TITLE, f"系统不允许启动记事本，可以直接看这个窗口里的内容。\n{self.path}")
 
 
-class FolderBrowser(tk.Toplevel):
-    """应用内目录浏览：外部资源管理器打不开时的兜底。"""
-
-    def __init__(self, master, folder: Path):
-        super().__init__(master)
-        self.title(f"目录内容 - {folder.name or folder}")
-        self.configure(bg=BG)
-        self.geometry("760x500")
-        self.minsize(520, 360)
-        self.folder = folder
-
-        wrap = ttk.Frame(self, padding=10)
-        wrap.pack(fill="both", expand=True)
-        wrap.columnconfigure(0, weight=1)
-        wrap.rowconfigure(2, weight=1)
-
-        bar = ttk.Frame(wrap)
-        bar.grid(row=0, column=0, sticky="ew")
-        bar.columnconfigure(1, weight=1)
-        ttk.Button(bar, text="上一级", command=self._go_up).grid(row=0, column=0, padx=(0, 6))
-        self.path_var = tk.StringVar()
-        ttk.Label(bar, textvariable=self.path_var, foreground=FG).grid(row=0, column=1, sticky="w")
-
-        ttk.Label(wrap, text="系统不允许自动打开资源管理器，这里是应用内浏览（路径已复制到剪贴板）",
-                  foreground=MUTED).grid(row=1, column=0, sticky="w", pady=(6, 4))
-
-        body = ttk.Frame(wrap)
-        body.grid(row=2, column=0, sticky="nsew")
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(body, columns=("size",), show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="名称", anchor="w")
-        self.tree.heading("size", text="大小", anchor="e")
-        self.tree.column("#0", width=480, minwidth=260, anchor="w")
-        self.tree.column("size", width=100, minwidth=90, anchor="e", stretch=False)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        self.tree.tag_configure("dir", foreground=GREEN)
-        self.tree.tag_configure("file", foreground=MUTED)
-        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.bind("<Double-1>", self._enter)
-
-        footer = ttk.Frame(wrap)
-        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(footer, text="关闭", command=self.destroy).pack(side="right")
-        ttk.Button(footer, text="复制路径",
-                   command=self._copy_path).pack(side="right", padx=(0, 6))
-        self._load(folder)
-
-    def _copy_path(self) -> None:
-        self.clipboard_clear()
-        self.clipboard_append(str(self.folder))
-
-    def _go_up(self) -> None:
-        if self.folder.parent != self.folder:
-            self._load(self.folder.parent)
-
-    def _enter(self, _event=None) -> None:
-        item = self.tree.focus()
-        if item and item != "..":
-            target = Path(item)
-            if target.is_dir():
-                self._load(target)
-
-    def _load(self, folder: Path) -> None:
-        try:
-            entries = list(folder.iterdir())
-        except OSError as exc:
-            messagebox.showerror(APP_TITLE, f"无法读取目录：{exc}", parent=self)
-            return
-        self.folder = folder
-        self.path_var.set(str(folder))
-        self.title(f"目录内容 - {folder.name or folder}")
-        self.tree.delete(*self.tree.get_children())
-        dirs = sorted((item for item in entries if item.is_dir()), key=lambda item: item.name.casefold())
-        files = sorted((item for item in entries if item.is_file()), key=lambda item: item.name.casefold())
-        if folder.parent != folder:
-            self.tree.insert("", "end", iid="..", text="..（上一级）", values=("",), tags=("dir",))
-        for item in dirs:
-            self.tree.insert("", "end", iid=str(item), text=item.name, values=("",), tags=("dir",))
-        for item in files:
-            try:
-                size = f"{item.stat().st_size / 1024:.0f} KB"
-            except OSError:
-                size = ""
-            self.tree.insert("", "end", iid=str(item), text=item.name, values=(size,), tags=("file",))
-
-
 class LrcApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -417,7 +248,7 @@ class LrcApp:
         self.checking_update = False
         self.dismissed_version = ""
         self.last_check_date = ""
-        self.settings_path = app_data_dir() / "settings.json"
+        self.settings_path = settings_dir() / "settings.json"
 
         self.folder_var = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=False)
@@ -514,6 +345,7 @@ class LrcApp:
         ttk.Radiobutton(prefer, text="简体", value="simplified", variable=self.prefer_var).pack(side="left")
         ttk.Radiobutton(prefer, text="繁体", value="traditional", variable=self.prefer_var).pack(
             side="left", padx=(8, 0))
+        CheckItem(prefer, text="强制转换", variable=self.convert_var).pack(side="left", padx=(18, 0))
 
         ttk.Label(options, text="识别格式").grid(row=0, column=2, sticky="e", padx=(18, 6))
         formats = ttk.Frame(options)
@@ -540,7 +372,6 @@ class LrcApp:
         ttk.Label(limits, text="行长(字)").pack(side="left")
         ttk.Spinbox(limits, from_=0, to=80, increment=1, width=5,
                     textvariable=self.max_line_var).pack(side="left", padx=(4, 16))
-        CheckItem(limits, text="强制转简体", variable=self.convert_var).pack(side="left")
 
         advanced = ttk.Frame(options)
         advanced.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
@@ -558,8 +389,6 @@ class LrcApp:
         ttk.Label(naming, text="文件名格式").pack(side="left")
         ttk.Combobox(naming, width=14, state="readonly", textvariable=self.name_format_var,
                      values=tuple(core.NAME_FORMATS.values())).pack(side="left", padx=(4, 8))
-        ttk.Label(naming, text="只有“与音频同名”能被按文件名查找歌词的播放器识别",
-                  foreground=MUTED).pack(side="left")
 
         actions = ttk.Frame(main)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -574,8 +403,7 @@ class LrcApp:
         self.report_button.pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="清除日志", command=self._clear_log).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="检查更新", command=self._manual_check).pack(
-            side="right", padx=(0, 8))
-        ttk.Button(actions, text="打开目录", command=self._open_folder).pack(side="right")
+            side="right")
 
         progress_row = ttk.Frame(main)
         progress_row.grid(row=3, column=0, sticky="ew")
@@ -779,16 +607,12 @@ class LrcApp:
             return
         TextViewer(self.root, f"预览 - {target.name}", content, target)
 
-    def _open_preview_dir(self, path) -> None:
-        self._reveal_folder(Path(path))
-
-    def _reveal_folder(self, folder: Path) -> None:
-        """优先交给资源管理器；shell 被系统拦住时退回应用内浏览。"""
-        if open_in_explorer(folder):
-            return
+    def _copy_path(self, path) -> None:
+        """目录链接不做“打开”，只把路径复制到剪贴板。"""
+        text = str(path)
         self.root.clipboard_clear()
-        self.root.clipboard_append(str(folder))
-        FolderBrowser(self.root, folder)
+        self.root.clipboard_append(text)
+        self._log("muted", f"已复制路径：{text}")
 
     def _cleanup_previews(self) -> None:
         """删掉本次运行生成的预览目录，顺手收掉空的父目录。"""
@@ -824,13 +648,6 @@ class LrcApp:
         picked = Path(chosen)
         # 选到文件就用它所在的目录；选到目录（手输路径时可能）就直接用
         self.folder_var.set(str(picked if picked.is_dir() else picked.parent))
-
-    def _open_folder(self) -> None:
-        folder = Path(self.folder_var.get().strip())
-        if not folder.is_dir():
-            messagebox.showerror(APP_TITLE, "请先选择有效的音乐目录。")
-            return
-        self._reveal_folder(folder)
 
     def _set_running(self, running: bool, mode: str = "generate") -> None:
         self.running = running
@@ -889,8 +706,8 @@ class LrcApp:
                 candidate.mkdir(parents=True, exist_ok=True)
                 self.preview_dir = candidate
                 self._preview_dirs.append(candidate)
-                self._log_link(f"预览文件会写到 {candidate}（点击打开该目录）",
-                               candidate, self._open_preview_dir)
+                self._log_link(f"预览文件会写到 {candidate}（点击复制路径）",
+                               candidate, self._copy_path)
             except OSError as exc:
                 reason = getattr(exc, "strerror", None) or str(exc)
                 self._log("warn", f"无法在音乐目录下创建预览目录 {candidate}：{reason}")
@@ -904,7 +721,7 @@ class LrcApp:
             self.overwrite_var.get(), self.credits_var.get(), self.convert_var.get(),
             self.preview_var.get(), duration, end_tolerance, max_line,
             self.source_var.get(), self.encoding_var.get(), name_format,
-            self.preview_dir,
+            self.preview_dir, self.prefer_var.get(),
         )
         self.worker = threading.Thread(target=self._generate_worker, args=args, daemon=True)
         self.worker.start()
@@ -914,7 +731,8 @@ class LrcApp:
                          preview: bool, duration: float, end_tolerance: float,
                          max_line: int, source: str, encoding: str,
                          name_format: str = core.DEFAULT_NAME_FORMAT,
-                         preview_dir: Path | None = None) -> None:
+                         preview_dir: Path | None = None,
+                         convert_to: str = "simplified") -> None:
         errors: list[str] = []
         results: list[dict] = []
         try:
@@ -930,7 +748,7 @@ class LrcApp:
                         convert=convert, max_line_chars=max_line, drop_credits=credits,
                         overwrite=overwrite, duration_tolerance=duration,
                         end_time_tolerance=end_tolerance, name_format=name_format,
-                        preview_dir=preview_dir)
+                        preview_dir=preview_dir, convert_to=convert_to)
                 except Exception as exc:  # 单首异常不应中断整批
                     result = {"status": "error", "audio": str(path),
                               "message": f"处理失败: {type(exc).__name__}: {exc}"}
@@ -1126,8 +944,8 @@ class LrcApp:
         self.summary_label.configure(text=f"完成：{summary}")
         self._log("summary", f"全部完成：{summary}")
         if previewed and self.preview_dir is not None:
-            self._log_link(f"预览文件目录：{self.preview_dir}（点击打开）",
-                           self.preview_dir, self._open_preview_dir)
+            self._log_link(f"预览文件目录：{self.preview_dir}（点击复制路径）",
+                           self.preview_dir, self._copy_path)
         for error in errors:
             self._log("warn", f"扫描警告：{error}")
         self._save_settings()
@@ -1215,7 +1033,7 @@ def main() -> int:
         root.mainloop()
     except Exception:
         try:
-            log_dir = app_data_dir()
+            log_dir = settings_dir()
             log_dir.mkdir(parents=True, exist_ok=True)
             (log_dir / "gui_error.log").write_text(traceback.format_exc(), encoding="utf-8")
         except Exception:

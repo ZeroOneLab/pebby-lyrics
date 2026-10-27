@@ -71,6 +71,19 @@ def chinese_converter():
     return OpenCC("t2s")
 
 
+@lru_cache(maxsize=1)
+def traditional_converter():
+    from opencc import OpenCC
+    return OpenCC("s2t")
+
+
+def convert_text(text, form="simplified"):
+    """按目标文字形态强制转换；form 只认 simplified / traditional。"""
+    if form == "traditional":
+        return traditional_converter().convert(text)
+    return chinese_converter().convert(text)
+
+
 def canonical(text):
     """比较时归一简繁/全半角/空白；保留 live/remix 等版本信息。"""
     text = chinese_converter().convert(text)
@@ -713,7 +726,7 @@ def split_long_lines(lrc, track, max_chars):
 def process_file(path, encoding, dry_run, timeout, source="auto", prefer="simplified", convert=False,
                  max_line_chars=DEFAULT_MAX_LINE_CHARS, drop_credits=False, overwrite=False,
                  duration_tolerance=DURATION_TOLERANCE, end_time_tolerance=END_TIME_TOLERANCE,
-                 name_format=DEFAULT_NAME_FORMAT, preview_dir=None):
+                 name_format=DEFAULT_NAME_FORMAT, preview_dir=None, convert_to="simplified"):
     result = {"audio": str(path), "encoding": encoding, "overwrite": overwrite,
               "name_format": name_format}
     try:
@@ -755,10 +768,10 @@ def process_file(path, encoding, dry_run, timeout, source="auto", prefer="simpli
                 result["message"] += f"；已移除 {credits_removed} 行片头信息"
         result["text_processing"] = "original"
         if convert:
-            converted = chinese_converter().convert(text)
+            converted = convert_text(text, convert_to)
             if converted != text:
-                result["text_processing"] = "traditional-to-simplified"
-                result["message"] += "；已强制转简体（保留时间戳）"
+                result["text_processing"] = f"converted-to-{convert_to}"
+                result["message"] += f"；已强制转换为{'简体' if convert_to == 'simplified' else '繁体'}（保留时间戳）"
             text = converted
         text, split_count = split_long_lines(text, track, max_line_chars)
         if split_count:
@@ -870,7 +883,10 @@ def main():
                         help="LRC 文件名格式：same 与音频同名（默认，按文件名找侧车时才可靠）；"
                              "其余用标签重命名，可能不被播放器识别")
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有同名 LRC；默认跳过")
-    parser.add_argument("--simplify", action="store_true", help="可选：选中后强制把文本转简体；默认只按优先级选择，不转换")
+    parser.add_argument("--convert", choices=("simplified", "traditional"),
+                        help="强制把最终歌词转成指定形态（默认只按优先选择，不转换）")
+    parser.add_argument("--simplify", action="store_true",
+                        help="等价于 --convert simplified，保留给旧脚本")
     parser.add_argument("--max-line-chars", type=nonnegative_chars, default=DEFAULT_MAX_LINE_CHARS,
                         help=f"长句拆分阈值（字符），默认 {DEFAULT_MAX_LINE_CHARS}；0 不拆分")
     parser.add_argument("--dry-run", action="store_true", help="查询并校验，但不写 LRC")
@@ -880,7 +896,10 @@ def main():
     parser.add_argument("--timeout", type=positive_timeout, default=15, help="单次请求超时秒数，默认 15")
     args = parser.parse_args()
     prefer = "traditional" if args.keep_traditional else args.prefer
-    convert = args.simplify
+    convert_to = args.convert or ("simplified" if args.simplify else None)
+    convert = convert_to is not None
+    if not convert_to:
+        convert_to = "simplified"
     drop_credits = args.drop_credits
     root = args.root.expanduser().resolve()
     if not root.exists():
@@ -892,9 +911,13 @@ def main():
         parser.error("缺少 Mutagen/OpenCC，请先运行 prepare_lrc.cmd 安装依赖，或执行: python -m pip install -r requirements-lyrics.txt")
     errors = []
     files = scan_audio(root, errors)
+    if convert:
+        convert_label = f"强制转{'简体' if convert_to == 'simplified' else '繁体'}"
+    else:
+        convert_label = "保留来源文字"
     print(f"扫描: {root}\n音频: {len(files)} 个；编码: {args.encoding}；"
           f"优先{'简体' if prefer == 'simplified' else '繁体'}；"
-          f"{'强制转简体' if convert else '保留来源文字'}；"
+          f"{convert_label}；"
           f"行长≤{args.max_line_chars or '不限'}；"
           f"{'移除片头信息' if drop_credits else '保留片头信息'}；"
           f"文件名={NAME_FORMATS.get(args.name_format, args.name_format)}；"
@@ -905,7 +928,7 @@ def main():
             result = process_file(path, args.encoding, args.dry_run, args.timeout, args.source,
                                   prefer, convert, args.max_line_chars, drop_credits,
                                   overwrite=args.overwrite, name_format=args.name_format,
-                                  preview_dir=args.preview_dir)
+                                  preview_dir=args.preview_dir, convert_to=convert_to)
             results.append(result)
             print(f"[{result['status']}] {path.name}: {result['message']}")
             if result.get("preview_path"):
@@ -924,7 +947,8 @@ def main():
     if args.report:
         report = {"created_at": datetime.now().astimezone().isoformat(), "root": str(root),
                   "encoding": args.encoding, "source": args.source, "prefer": prefer,
-                  "convert": convert, "max_line_chars": args.max_line_chars,
+                  "convert": convert, "convert_to": convert_to if convert else None,
+                  "max_line_chars": args.max_line_chars,
                   "drop_credits": drop_credits, "overwrite": args.overwrite,
                   "name_format": args.name_format,
                   "preview_dir": str(args.preview_dir) if args.preview_dir else None,
