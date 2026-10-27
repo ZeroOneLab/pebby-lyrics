@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import queue
 import shutil
-import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -169,16 +168,6 @@ class CheckItem(tk.Frame):
                                  fg=GREEN if checked else MUTED)
 
 
-def open_with_notepad(path: Path) -> bool:
-    """用记事本打开文件（预览结果是临时文件，双击关联不一定可用）。"""
-    try:
-        subprocess.Popen(["notepad.exe", str(path)],
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return True
-    except OSError:
-        return False
-
-
 DISCLAIMER_TEXT = (
     "本工具仅供个人学习与自用。\n"
     "歌词内容版权归原权利人所有。\n"
@@ -256,7 +245,6 @@ class TextViewer(tk.Toplevel):
         self.on_saved = on_saved
         self.encoding = encoding
         self.content = content
-        self.original = content
         self.editable = save_path is not None
 
         wrap = ttk.Frame(self, padding=10)
@@ -285,16 +273,9 @@ class TextViewer(tk.Toplevel):
         bar = ttk.Frame(wrap)
         bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(bar, text="关闭", command=self.destroy).pack(side="right")
-        if path is not None:
-            ttk.Button(bar, text="用记事本打开",
-                       command=self._open_external).pack(side="right", padx=(0, 6))
-        ttk.Button(bar, text="复制全文",
-                   command=self._copy).pack(side="right", padx=(0, 6))
         if self.editable:
             self.save_button = ttk.Button(bar, text="保存到歌曲目录", command=self._save)
             self.save_button.pack(side="right", padx=(0, 6))
-            ttk.Button(bar, text="撤销修改",
-                       command=self._revert).pack(side="left", padx=(6, 0))
             ttk.Button(bar, text="转简体",
                        command=lambda: self._convert("simplified")).pack(side="left")
             ttk.Button(bar, text="转繁体",
@@ -318,18 +299,6 @@ class TextViewer(tk.Toplevel):
             return
         self.text.edit_modified(False)
         self.title(f"{self.base_title} · 已修改（未保存）")
-
-    def _copy(self) -> None:
-        self.clipboard_clear()
-        self.clipboard_append(self._current_text())
-
-    def _open_external(self) -> None:
-        if self.path is not None and not open_with_notepad(self.path):
-            messagebox.showerror(APP_TITLE, f"系统不允许启动记事本，可以直接看这个窗口里的内容。\n{self.path}")
-
-    def _revert(self) -> None:
-        self._set_content(self.original)
-        self.title(self.base_title)
 
     def _convert(self, form: str) -> None:
         """只在预览窗口提供：转完可以继续改或直接保存。"""
