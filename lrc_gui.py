@@ -180,12 +180,9 @@ def open_with_notepad(path: Path) -> bool:
 
 
 DISCLAIMER_TEXT = (
-    "本工具用于整理你自己已拥有的音乐，仅供个人学习与自用。\n\n"
-    "· 歌词文本的版权归原权利人所有。本工具只读取公开可访问的歌词接口，\n"
-    "  不提供音频下载，不绕过付费、登录或地区限制。\n"
-    "· 请遵守你所在地区的法律以及各音乐平台的服务条款；因使用本工具\n"
-    "  产生的任何后果由使用者自行承担。\n"
-    "· 本工具不收集个人信息。更新检查默认关闭，开启后也只请求版本号。"
+    "本工具仅供个人学习与自用。\n"
+    "歌词内容版权归原权利人所有。\n"
+    "请勿用于商业传播。"
 )
 
 
@@ -200,19 +197,22 @@ class DisclaimerDialog(tk.Toplevel):
         self.transient(master)
         self.on_done = on_done
 
-        wrap = ttk.Frame(self, padding=16)
+        wrap = ttk.Frame(self, padding=(20, 18))
         wrap.pack(fill="both", expand=True)
         ttk.Label(wrap, text=DISCLAIMER_TEXT, justify="left",
                   foreground=FG).pack(anchor="w")
         self.no_show_var = tk.BooleanVar(value=True)
         CheckItem(wrap, text="下次启动不再显示", variable=self.no_show_var).pack(
-            anchor="w", pady=(14, 0))
+            anchor="w", pady=(16, 0))
 
         bar = ttk.Frame(wrap)
-        bar.pack(fill="x", pady=(14, 0))
+        bar.pack(fill="x", pady=(16, 0))
         ttk.Button(bar, text="确定", command=self._accept).pack(side="right")
         self.protocol("WM_DELETE_WINDOW", self._accept)
         self.bind("<Escape>", lambda _event: self._accept())
+        # 文案很短，给个下限宽度，免得窗口挤成一条
+        self.update_idletasks()
+        self.geometry(f"{max(400, self.winfo_reqwidth())}x{self.winfo_reqheight()}")
         self.grab_set()
 
     def _accept(self) -> None:
